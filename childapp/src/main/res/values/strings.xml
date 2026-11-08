@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">CBC Hub Pro Child</string>
+    <string name="accessibility_service_description">This service is required for app blocking and monitoring features.</string>
+    <string name="device_admin_label">CBC Hub Safety Admin</string>
+    <string name="device_admin_description">Ensures safety features remain active and prevents unauthorized uninstallation of CBC Hub Pro.</string>
+</resources>
