@@ -263,13 +263,20 @@ class DiscoveryViewModel : ViewModel() {
             .whereEqualTo("role", role)
             .get().await()
 
-        return snapshots.documents.map { doc ->
+        val vendorDocuments = snapshots.documents.filterNot { doc ->
+            role == "parent/guardian" && doc.id == auth.currentUser?.uid
+        }
+
+        return vendorDocuments.map { doc ->
             val products = db.collection("users").document(doc.id)
                 .collection("products").get().await()
                 .documents.mapNotNull { pDoc ->
                     try {
                         pDoc.toObject(ProductItem::class.java)?.copy(id = pDoc.id)
                     } catch (e: Exception) { null }
+                }.filter { product ->
+                    role != "parent/guardian" ||
+                        (product.isForSwap && product.status.equals("Available", ignoreCase = true))
                 }
 
             VendorWithProducts(
@@ -545,31 +552,67 @@ class DiscoveryViewModel : ViewModel() {
 
     fun requestSwap(targetVendorId: String, targetVendorName: String, targetProductId: String, offeredProductId: String? = null, cashTopUp: Double = 0.0) {
         val uid = auth.currentUser?.uid ?: return
-        val name = auth.currentUser?.displayName ?: "Anonymous"
-        
         viewModelScope.launch {
-            val swapRequest = SwapRequest(
-                senderId = uid,
-                senderName = name,
-                receiverId = targetVendorId,
-                receiverName = targetVendorName,
-                requestedItemId = targetProductId,
-                offeredItemId = offeredProductId,
-                cashOffered = cashTopUp,
-                status = SwapRequestStatus.PENDING
-            )
-            db.collection("swap_requests").add(swapRequest).await()
-            _statusMessage.value = "Swap request sent successfully!"
+            try {
+                val name = auth.currentUser?.displayName
+                    ?: db.collection("users").document(uid).get().await().getString("name")
+                    ?: "Parent"
+                val requestedSnapshot = db.collection("users").document(targetVendorId)
+                    .collection("products").document(targetProductId).get().await()
+                val requestedItem = requestedSnapshot.toObject(ProductItem::class.java)
+                    ?: throw IllegalStateException("This item is no longer available")
+                if (!requestedItem.isForSwap || !requestedItem.status.equals("Available", ignoreCase = true)) {
+                    throw IllegalStateException("This item is no longer available for swapping")
+                }
+                val offeredItem = offeredProductId?.let { id ->
+                    db.collection("users").document(uid).collection("products").document(id)
+                        .get().await().toObject(ProductItem::class.java)
+                        ?: throw IllegalStateException("Your offered item is no longer available")
+                }
+                if (offeredItem != null && (!offeredItem.isForSwap || !offeredItem.status.equals("Available", ignoreCase = true))) {
+                    throw IllegalStateException("Your offered item is no longer available for swapping")
+                }
+                if (cashTopUp < 0.0) throw IllegalArgumentException("Cash offer cannot be negative")
+
+                val swapRequest = SwapRequest(
+                    senderId = uid,
+                    senderName = name,
+                    receiverId = targetVendorId,
+                    receiverName = targetVendorName,
+                    requestedItemId = targetProductId,
+                    offeredItemId = offeredProductId,
+                    requestedItemName = requestedItem.name,
+                    requestedItemImageUrl = requestedItem.imageUrls.firstOrNull().orEmpty(),
+                    requestedItemValue = requestedItem.price,
+                    offeredItemName = offeredItem?.name.orEmpty(),
+                    offeredItemImageUrl = offeredItem?.imageUrls?.firstOrNull().orEmpty(),
+                    offeredItemValue = offeredItem?.price ?: 0.0,
+                    cashOffered = cashTopUp,
+                    status = SwapRequestStatus.PENDING
+                )
+                db.collection("swap_requests").add(swapRequest).await()
+                _statusMessage.value = "Swap request sent successfully!"
+            } catch (e: Exception) {
+                _statusMessage.value = "Could not send swap request: ${e.message ?: "Please try again."}"
+            }
         }
     }
 
-    fun initiateBookingPayment(prof: ProfessionalProfile, phone: String, onSuccess: (String) -> Unit) {
+    fun initiateBookingPayment(
+        prof: ProfessionalProfile,
+        phone: String,
+        appointmentDate: String,
+        appointmentTime: String,
+        notes: String,
+        onSuccess: (String) -> Unit
+    ) {
         val uid = auth.currentUser?.uid ?: return
         val name = auth.currentUser?.displayName ?: "User"
         
         viewModelScope.launch {
             try {
                 val checkoutRef = db.collection("payment_requests").document()
+                val bookingRef = db.collection("service_bookings").document(checkoutRef.id)
                 val paymentPayload = mapOf(
                     "id" to checkoutRef.id,
                     "userId" to uid,
@@ -579,9 +622,28 @@ class DiscoveryViewModel : ViewModel() {
                     "status" to "PENDING",
                     "timestamp" to com.google.firebase.Timestamp.now(),
                     "professionalId" to prof.uid,
-                    "professionalName" to prof.name
+                    "professionalName" to prof.name,
+                    "serviceBookingId" to bookingRef.id
                 )
-                checkoutRef.set(paymentPayload).await()
+                val bookingPayload = mapOf(
+                    "id" to bookingRef.id,
+                    "buyerId" to uid,
+                    "buyerName" to name,
+                    "buyerContact" to phone,
+                    "serviceProviderId" to prof.uid,
+                    "serviceName" to "${prof.role} appointment",
+                    "amount" to prof.bookingPrice,
+                    "status" to OrderStatus.PENDING.name,
+                    "bookingStatus" to "REQUESTED",
+                    "createdAt" to com.google.firebase.Timestamp.now(),
+                    "appointmentDate" to appointmentDate,
+                    "appointmentTime" to appointmentTime,
+                    "notes" to notes
+                )
+                db.runBatch { batch ->
+                    batch.set(checkoutRef, paymentPayload)
+                    batch.set(bookingRef, bookingPayload)
+                }.await()
 
                 val order = Order(
                     id = checkoutRef.id,

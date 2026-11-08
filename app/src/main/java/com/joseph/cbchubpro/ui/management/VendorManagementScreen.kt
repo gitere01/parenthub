@@ -26,6 +26,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -43,12 +44,15 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.Timestamp
 import com.google.firebase.storage.FirebaseStorage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -89,6 +93,10 @@ class VendorViewModel : ViewModel() {
 
     private val _swapRequests = MutableStateFlow<List<SwapRequest>>(emptyList())
     val swapRequests = _swapRequests.asStateFlow()
+    private var receivedSwapListener: ListenerRegistration? = null
+    private var sentSwapListener: ListenerRegistration? = null
+    private var receivedSwapRequests: List<SwapRequest> = emptyList()
+    private var sentSwapRequests: List<SwapRequest> = emptyList()
 
     private val _vendorName = MutableStateFlow("")
 
@@ -154,15 +162,28 @@ class VendorViewModel : ViewModel() {
                     .forEach { fetchLiveTracking(it.id) }
             }
 
-        db.collection("swap_requests").whereEqualTo("receiverId", uid)
+        receivedSwapListener?.remove()
+        sentSwapListener?.remove()
+        receivedSwapListener = db.collection("swap_requests").whereEqualTo("receiverId", uid)
             .addSnapshotListener { snapshot, _ ->
-                val received = snapshot?.documents?.mapNotNull { it.toObject(SwapRequest::class.java)?.copy(id = it.id) } ?: emptyList()
-                db.collection("swap_requests").whereEqualTo("senderId", uid)
-                    .addSnapshotListener { snapshot2, _ ->
-                        val sent = snapshot2?.documents?.mapNotNull { it.toObject(SwapRequest::class.java)?.copy(id = it.id) } ?: emptyList()
-                        _swapRequests.value = (received + sent).sortedByDescending { it.createdAt }
-                    }
+                receivedSwapRequests = snapshot?.documents?.mapNotNull {
+                    it.toObject(SwapRequest::class.java)?.copy(id = it.id)
+                }.orEmpty()
+                publishSwapRequests()
             }
+        sentSwapListener = db.collection("swap_requests").whereEqualTo("senderId", uid)
+            .addSnapshotListener { snapshot, _ ->
+                sentSwapRequests = snapshot?.documents?.mapNotNull {
+                    it.toObject(SwapRequest::class.java)?.copy(id = it.id)
+                }.orEmpty()
+                publishSwapRequests()
+            }
+    }
+
+    private fun publishSwapRequests() {
+        _swapRequests.value = (receivedSwapRequests + sentSwapRequests)
+            .distinctBy { it.id }
+            .sortedByDescending { it.createdAt }
     }
 
     fun fetchLiveTracking(orderId: String) {
@@ -243,10 +264,154 @@ class VendorViewModel : ViewModel() {
     }
 
     fun updateSwapStatus(requestId: String, newStatus: SwapRequestStatus) {
+        val uid = auth.currentUser?.uid ?: return
         viewModelScope.launch {
-            db.collection("swap_requests").document(requestId).update("status", newStatus).await()
-            if (newStatus == SwapRequestStatus.ACCEPTED) {
-                _statusMessage.value = "Swap Accepted! Chat is now unlocked."
+            try {
+                db.runTransaction { transaction ->
+                    val ref = db.collection("swap_requests").document(requestId)
+                    val request = transaction.get(ref).toObject(SwapRequest::class.java)
+                        ?: throw IllegalStateException("Swap request not found")
+                    when (newStatus) {
+                        SwapRequestStatus.ACCEPTED, SwapRequestStatus.REJECTED -> {
+                            if (request.receiverId != uid || request.status != SwapRequestStatus.PENDING) {
+                                throw IllegalStateException("Only the recipient can respond to a pending request")
+                            }
+                            if (newStatus == SwapRequestStatus.ACCEPTED) {
+                                val requestedItemRef = db.collection("users").document(request.receiverId)
+                                    .collection("products").document(request.requestedItemId)
+                                val requestedItem = transaction.get(requestedItemRef)
+                                val requestedData = requestedItem.data
+                                    ?: throw IllegalStateException("The requested item is no longer listed")
+                                if (!(requestedData["status"] as? String ?: "Available").equals("Available", ignoreCase = true) || requestedData["isForSwap"] == false) {
+                                    throw IllegalStateException("The requested item is no longer available")
+                                }
+
+                                val offeredItemRef = request.offeredItemId?.let { id ->
+                                    db.collection("users").document(request.senderId).collection("products").document(id)
+                                }
+                                val offeredItem = offeredItemRef?.let { transaction.get(it) }
+                                if (offeredItemRef != null) {
+                                    val offeredData = offeredItem?.data
+                                        ?: throw IllegalStateException("The offered item is no longer listed")
+                                    if (!(offeredData["status"] as? String ?: "Available").equals("Available", ignoreCase = true) || offeredData["isForSwap"] == false) {
+                                        throw IllegalStateException("The offered item is no longer available")
+                                    }
+                                }
+                                transaction.update(requestedItemRef, mapOf("status" to "Reserved"))
+                                if (offeredItemRef != null) transaction.update(offeredItemRef, mapOf("status" to "Reserved"))
+                            }
+                        }
+                        SwapRequestStatus.CANCELLED -> {
+                            val senderCancelsPending = request.senderId == uid && request.status == SwapRequestStatus.PENDING
+                            val participantCancelsAccepted =
+                                (request.senderId == uid || request.receiverId == uid) &&
+                                    request.status == SwapRequestStatus.ACCEPTED &&
+                                    !request.senderConfirmed && !request.receiverConfirmed
+                            if (!senderCancelsPending && !participantCancelsAccepted) {
+                                throw IllegalStateException("This exchange can no longer be cancelled")
+                            }
+                            if (participantCancelsAccepted) {
+                                val requestedItemRef = db.collection("users").document(request.receiverId)
+                                    .collection("products").document(request.requestedItemId)
+                                val requestedItem = transaction.get(requestedItemRef)
+                                val offeredItemRef = request.offeredItemId?.let { id ->
+                                    db.collection("users").document(request.senderId).collection("products").document(id)
+                                }
+                                val offeredItem = offeredItemRef?.let { transaction.get(it) }
+                                if (requestedItem.exists() && requestedItem.getString("status") == "Reserved") {
+                                    transaction.update(requestedItemRef, mapOf("status" to "Available"))
+                                }
+                                if (offeredItemRef != null && offeredItem?.exists() == true && offeredItem.getString("status") == "Reserved") {
+                                    transaction.update(offeredItemRef, mapOf("status" to "Available"))
+                                }
+                            }
+                        }
+                        else -> throw IllegalArgumentException("Use the exchange confirmation action for this status")
+                    }
+                    transaction.update(ref, mapOf("status" to newStatus.name, "updatedAt" to Timestamp.now()))
+                }.await()
+                _statusMessage.value = when (newStatus) {
+                    SwapRequestStatus.ACCEPTED -> "Swap accepted. You can now message each other."
+                    SwapRequestStatus.REJECTED -> "Swap request declined."
+                    SwapRequestStatus.CANCELLED -> "Swap request cancelled."
+                    else -> "Swap request updated."
+                }
+            } catch (e: Exception) {
+                _statusMessage.value = e.message ?: "Could not update swap request."
+            }
+        }
+    }
+
+    fun confirmSwapCompleted(requestId: String) {
+        val uid = auth.currentUser?.uid ?: return
+        viewModelScope.launch {
+            try {
+                val completed = db.runTransaction { transaction ->
+                    val ref = db.collection("swap_requests").document(requestId)
+                    val request = transaction.get(ref).toObject(SwapRequest::class.java)
+                        ?: throw IllegalStateException("Swap request not found")
+                    if (request.status != SwapRequestStatus.ACCEPTED) {
+                        throw IllegalStateException("Only an accepted swap can be confirmed")
+                    }
+                    val senderConfirmed = request.senderConfirmed || request.senderId == uid
+                    val receiverConfirmed = request.receiverConfirmed || request.receiverId == uid
+                    if (!senderConfirmed && !receiverConfirmed) throw IllegalStateException("You are not part of this swap")
+                    val bothConfirmed = senderConfirmed && receiverConfirmed
+                    val requestedItemRef = db.collection("users").document(request.receiverId)
+                        .collection("products").document(request.requestedItemId)
+                    val requestedItemSnapshot = transaction.get(requestedItemRef)
+                    val offeredItemRef = request.offeredItemId?.let { id ->
+                        db.collection("users").document(request.senderId).collection("products").document(id)
+                    }
+                    val offeredItemSnapshot = offeredItemRef?.let { transaction.get(it) }
+                    if (bothConfirmed) {
+                        if (!requestedItemSnapshot.exists()) throw IllegalStateException("The requested listing could not be found")
+                        if (offeredItemRef != null && offeredItemSnapshot?.exists() != true) {
+                            throw IllegalStateException("The offered listing could not be found")
+                        }
+                    }
+                    transaction.update(ref, mapOf(
+                        "senderConfirmed" to senderConfirmed,
+                        "receiverConfirmed" to receiverConfirmed,
+                        "status" to if (bothConfirmed) SwapRequestStatus.COMPLETED.name else SwapRequestStatus.ACCEPTED.name,
+                        "updatedAt" to Timestamp.now()
+                    ))
+                    if (bothConfirmed) {
+                        transaction.update(requestedItemRef, mapOf("status" to "Exchanged", "isForSwap" to false))
+                        if (offeredItemRef != null) transaction.update(offeredItemRef, mapOf("status" to "Exchanged", "isForSwap" to false))
+                    }
+                    bothConfirmed
+                }.await()
+                _statusMessage.value = if (completed) "Both parents confirmed. Swap completed!" else "Your confirmation is saved; waiting for the other parent."
+            } catch (e: Exception) {
+                _statusMessage.value = e.message ?: "Could not confirm this exchange."
+            }
+        }
+    }
+
+    fun sendSwapMessage(request: SwapRequest, message: String) {
+        val uid = auth.currentUser?.uid ?: return
+        val cleanMessage = message.trim().take(2000)
+        if (cleanMessage.isEmpty()) return
+        viewModelScope.launch {
+            try {
+                val currentRequest = db.collection("swap_requests").document(request.id).get().await()
+                    .toObject(SwapRequest::class.java)
+                    ?: throw IllegalStateException("Swap request not found")
+                if (currentRequest.status != SwapRequestStatus.ACCEPTED && currentRequest.status != SwapRequestStatus.COMPLETED) {
+                    throw IllegalStateException("Messaging is available after a swap is accepted")
+                }
+                if (uid != currentRequest.senderId && uid != currentRequest.receiverId) {
+                    throw IllegalStateException("You are not part of this swap")
+                }
+                db.collection("swap_requests").document(request.id).collection("messages").add(mapOf(
+                    "senderId" to uid,
+                    "senderName" to _vendorName.value.ifBlank { auth.currentUser?.displayName ?: "Parent" },
+                    "text" to cleanMessage,
+                    "createdAt" to Timestamp.now()
+                )).await()
+            } catch (e: Exception) {
+                _statusMessage.value = e.message ?: "Could not send message."
             }
         }
     }
@@ -381,12 +546,27 @@ class VendorViewModel : ViewModel() {
     }
 
     fun clearStatusMessage() { _statusMessage.value = null }
+
+    override fun onCleared() {
+        receivedSwapListener?.remove()
+        sentSwapListener?.remove()
+        super.onCleared()
+    }
 }
+
+private data class SwapChatMessage(
+    val id: String,
+    val senderId: String,
+    val senderName: String,
+    val text: String,
+    val createdAt: Timestamp?
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VendorManagementScreen(onLogoutClicked: () -> Unit, viewModel: VendorViewModel = viewModel()) {
     var selectedTab by remember { mutableIntStateOf(0) }
+    var chattingSwap by remember { mutableStateOf<SwapRequest?>(null) }
     val userRole by viewModel.userRole.collectAsState()
     val trackingInfo by viewModel.trackingInfo.collectAsState()
     
@@ -451,7 +631,7 @@ fun VendorManagementScreen(onLogoutClicked: () -> Unit, viewModel: VendorViewMod
                 when (selectedTab) {
                     0 -> ParentInventoryTab(items, viewModel, isUploading)
                     1 -> SwapRequestsTab(swaps, viewModel)
-                    2 -> Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Chat coming soon") }
+                    2 -> SwapChatsTab(swaps) { chattingSwap = it }
                     3 -> Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Account Settings") }
                 }
             } else {
@@ -464,6 +644,10 @@ fun VendorManagementScreen(onLogoutClicked: () -> Unit, viewModel: VendorViewMod
                 }
             }
         }
+    }
+
+    chattingSwap?.let { request ->
+        SwapChatDialog(request, viewModel) { chattingSwap = null }
     }
 }
 
@@ -542,6 +726,21 @@ fun ProductInventoryCard(
                 Text(item.name, fontWeight = FontWeight.Bold)
                 if (isParent) {
                     Text("Value: KES ${item.price}", style = MaterialTheme.typography.bodySmall)
+                    Badge(containerColor = when (item.status.lowercase()) {
+                        "reserved" -> Color(0xFFFFF3E0)
+                        "exchanged" -> MaterialTheme.colorScheme.surfaceVariant
+                        else -> Color(0xFFE8F5E9)
+                    }) {
+                        Text(
+                            item.status.uppercase(),
+                            color = when (item.status.lowercase()) {
+                                "reserved" -> Color(0xFFE65100)
+                                "exchanged" -> Color.Gray
+                                else -> Color(0xFF2E7D32)
+                            },
+                            fontSize = 8.sp
+                        )
+                    }
                     VerificationBadge(item.verificationStatus)
                 } else {
                     Text(item.listingType.name, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary)
@@ -564,7 +763,7 @@ fun ProductInventoryCard(
             }
             
             Box {
-                IconButton(onClick = { showMenu = true }) {
+                IconButton(onClick = { showMenu = true }, enabled = !item.status.equals("Reserved", ignoreCase = true)) {
                     Icon(Icons.Default.MoreVert, contentDescription = "Options")
                 }
                 DropdownMenu(
@@ -948,9 +1147,14 @@ fun ShipOrderDialog(deliveryMethod: DeliveryMethod, onDismiss: () -> Unit, onCon
 @Composable
 fun SwapRequestsTab(swaps: List<SwapRequest>, viewModel: VendorViewModel) {
     val uid = FirebaseAuth.getInstance().currentUser?.uid
+    var chattingSwap by remember { mutableStateOf<SwapRequest?>(null) }
     LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         if (swaps.isEmpty()) {
-            item { Box(modifier = Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) { Text("No swap requests yet", color = Color.Gray) } }
+            item {
+                Box(modifier = Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("No swap requests yet. Browse the Swap Hub to find an item to exchange.", color = Color.Gray, textAlign = TextAlign.Center)
+                }
+            }
         }
         items(swaps) { request ->
             val isReceived = request.receiverId == uid
@@ -961,12 +1165,40 @@ fun SwapRequestsTab(swaps: List<SwapRequest>, viewModel: VendorViewModel) {
                         Text(request.status.name, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall)
                     }
                     Spacer(Modifier.height(8.dp))
-                    Text("Requested Item ID: ${request.requestedItemId.take(8)}...")
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        if (request.requestedItemImageUrl.isNotBlank()) {
+                            AsyncImage(
+                                model = request.requestedItemImageUrl,
+                                contentDescription = request.requestedItemName,
+                                modifier = Modifier.size(60.dp).clip(RoundedCornerShape(8.dp)),
+                                contentScale = ContentScale.Crop
+                            )
+                        }
+                        Column {
+                            Text("Requested: ${request.requestedItemName.ifBlank { "Item details unavailable" }}", fontWeight = FontWeight.SemiBold)
+                            if (request.requestedItemValue > 0) Text("Listed value: KES ${request.requestedItemValue}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                        }
+                    }
                     if (request.offeredItemId != null) {
-                        Text("Offered Item ID: ${request.offeredItemId.take(8)}...")
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(top = 8.dp)) {
+                            if (request.offeredItemImageUrl.isNotBlank()) {
+                                AsyncImage(
+                                    model = request.offeredItemImageUrl,
+                                    contentDescription = request.offeredItemName,
+                                    modifier = Modifier.size(60.dp).clip(RoundedCornerShape(8.dp)),
+                                    contentScale = ContentScale.Crop
+                                )
+                            }
+                            Column {
+                                Text("Offered: ${request.offeredItemName.ifBlank { "Item details unavailable" }}", fontWeight = FontWeight.SemiBold)
+                                if (request.offeredItemValue > 0) Text("Offered item value: KES ${request.offeredItemValue}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                            }
+                        }
+                    } else {
+                        Text("No physical item offered")
                     }
                     if (request.cashOffered > 0) {
-                        Text("Cash Top-up: KES ${request.cashOffered}", color = Color(0xFF4CAF50), fontWeight = FontWeight.Bold)
+                        Text("Cash top-up: KES ${request.cashOffered}", color = Color(0xFF4CAF50), fontWeight = FontWeight.Bold)
                     }
                     
                     if (isReceived && request.status == SwapRequestStatus.PENDING) {
@@ -975,13 +1207,158 @@ fun SwapRequestsTab(swaps: List<SwapRequest>, viewModel: VendorViewModel) {
                             Button(onClick = { viewModel.updateSwapStatus(request.id, SwapRequestStatus.ACCEPTED) }, modifier = Modifier.weight(1f)) { Text("Accept") }
                             OutlinedButton(onClick = { viewModel.updateSwapStatus(request.id, SwapRequestStatus.REJECTED) }, modifier = Modifier.weight(1f)) { Text("Decline") }
                         }
-                    } else if (request.status == SwapRequestStatus.ACCEPTED) {
+                    } else if (!isReceived && request.status == SwapRequestStatus.PENDING) {
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedButton(onClick = { viewModel.updateSwapStatus(request.id, SwapRequestStatus.CANCELLED) }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Cancel request")
+                        }
+                    }
+
+                    if (request.status == SwapRequestStatus.ACCEPTED || request.status == SwapRequestStatus.COMPLETED) {
                         Spacer(Modifier.height(16.dp))
-                        Button(onClick = { /* Open Chat */ }, modifier = Modifier.fillMaxWidth()) {
+                        Button(onClick = { chattingSwap = request }, modifier = Modifier.fillMaxWidth()) {
                             Icon(Icons.AutoMirrored.Filled.Chat, null)
                             Spacer(Modifier.width(8.dp))
                             Text("Open Chat")
                         }
+                        if (request.status == SwapRequestStatus.ACCEPTED) {
+                            val selfConfirmed = if (isReceived) request.receiverConfirmed else request.senderConfirmed
+                            val otherConfirmed = if (isReceived) request.senderConfirmed else request.receiverConfirmed
+                            Text(
+                                when {
+                                    selfConfirmed && otherConfirmed -> "Both parents confirmed the exchange."
+                                    selfConfirmed -> "Your confirmation is saved. Waiting for the other parent."
+                                    otherConfirmed -> "The other parent confirmed. Confirm when your exchange is complete."
+                                    else -> "Confirm only after you have exchanged the items."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.Gray,
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                            if (!selfConfirmed) {
+                                OutlinedButton(
+                                    onClick = { viewModel.confirmSwapCompleted(request.id) },
+                                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                                ) { Text("Confirm items exchanged") }
+                            }
+                            if (!request.senderConfirmed && !request.receiverConfirmed) {
+                                TextButton(
+                                    onClick = { viewModel.updateSwapStatus(request.id, SwapRequestStatus.CANCELLED) },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) { Text("Cancel this exchange") }
+                            }
+                        } else {
+                            Text("Exchange completed by both parents", color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    chattingSwap?.let { request -> SwapChatDialog(request, viewModel) { chattingSwap = null } }
+}
+
+@Composable
+private fun SwapChatsTab(swaps: List<SwapRequest>, onOpenChat: (SwapRequest) -> Unit) {
+    val activeSwaps = swaps.filter { it.status == SwapRequestStatus.ACCEPTED || it.status == SwapRequestStatus.COMPLETED }
+    LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (activeSwaps.isEmpty()) {
+            item {
+                Box(modifier = Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Chats appear here after a parent accepts your swap request.", color = Color.Gray, textAlign = TextAlign.Center)
+                }
+            }
+        }
+        items(activeSwaps, key = { it.id }) { request ->
+            val uid = FirebaseAuth.getInstance().currentUser?.uid
+            val otherParent = if (request.senderId == uid) request.receiverName else request.senderName
+            Card(modifier = Modifier.fillMaxWidth().clickable { onOpenChat(request) }) {
+                Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.AutoMirrored.Filled.Chat, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(otherParent, fontWeight = FontWeight.Bold)
+                        Text(request.requestedItemName.ifBlank { "Swap discussion" }, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                    }
+                    Text("Message", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SwapChatDialog(request: SwapRequest, viewModel: VendorViewModel, onDismiss: () -> Unit) {
+    val uid = FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+    var messages by remember(request.id) { mutableStateOf<List<SwapChatMessage>>(emptyList()) }
+    var draft by remember(request.id) { mutableStateOf("") }
+    val db = remember { FirebaseFirestore.getInstance() }
+
+    DisposableEffect(request.id) {
+        val listener = db.collection("swap_requests").document(request.id).collection("messages")
+            .orderBy("createdAt")
+            .addSnapshotListener { snapshot, _ ->
+                messages = snapshot?.documents?.mapNotNull { document ->
+                    val text = document.getString("text") ?: return@mapNotNull null
+                    SwapChatMessage(
+                        id = document.id,
+                        senderId = document.getString("senderId").orEmpty(),
+                        senderName = document.getString("senderName").orEmpty(),
+                        text = text,
+                        createdAt = document.getTimestamp("createdAt")
+                    )
+                }.orEmpty()
+            }
+        onDispose { listener.remove() }
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
+            Column(modifier = Modifier.fillMaxWidth().heightIn(min = 400.dp, max = 680.dp).padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Swap chat", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                        Text("${request.senderName} ↔ ${request.receiverName}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                    }
+                    IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, contentDescription = "Close chat") }
+                }
+                HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (messages.isEmpty()) {
+                        item { Text("Agree on a safe time and public place to exchange items.", color = Color.Gray, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(vertical = 12.dp)) }
+                    }
+                    items(messages, key = { it.id }) { message ->
+                        val isMine = message.senderId == uid
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = if (isMine) Arrangement.End else Arrangement.Start) {
+                            Surface(
+                                color = if (isMine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                                shape = RoundedCornerShape(14.dp),
+                                modifier = Modifier.widthIn(max = 280.dp)
+                            ) {
+                                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                                    if (!isMine) Text(message.senderName, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                                    Text(message.text, style = MaterialTheme.typography.bodyMedium)
+                                }
+                            }
+                        }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = draft,
+                        onValueChange = { if (it.length <= 2000) draft = it },
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("Message the other parent") },
+                        maxLines = 4
+                    )
+                    IconButton(onClick = {
+                        val message = draft.trim()
+                        if (message.isNotEmpty()) {
+                            viewModel.sendSwapMessage(request, message)
+                            draft = ""
+                        }
+                    }, enabled = draft.isNotBlank()) {
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send message", tint = MaterialTheme.colorScheme.primary)
                     }
                 }
             }

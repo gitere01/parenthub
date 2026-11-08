@@ -1,5 +1,6 @@
 package com.joseph.cbchubpro.ui.family
 
+import android.app.TimePickerDialog
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
@@ -383,12 +384,59 @@ fun PermissionStatusRow(label: String, isGranted: Boolean) {
 }
 
 @Composable
+@OptIn(ExperimentalLayoutApi::class)
 fun AndroidTvSection(childId: String, childData: Map<String, Any>?) {
     val db = FirebaseFirestore.getInstance()
     val tvLocked = childData?.get("tvLocked") as? Boolean ?: false
-    var tvTimeLimit by remember { mutableIntStateOf((childData?.get("tvDailyTimeLimit") as? Long)?.toInt() ?: 120) }
+    var tvTimeLimit by remember(childId, childData?.get("tvDailyTimeLimit")) {
+        mutableIntStateOf((childData?.get("tvDailyTimeLimit") as? Number)?.toInt() ?: 120)
+    }
     val lastTvSync = childData?.get("lastTvSync") as? com.google.firebase.Timestamp
     val dateFormat = remember { SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()) }
+    val schedule = childData?.get("tvScreenTimeSchedule") as? Map<*, *>
+    var scheduleEnabled by remember(childId, schedule?.get("enabled")) {
+        mutableStateOf(schedule?.get("enabled") as? Boolean ?: false)
+    }
+    var startMinute by remember(childId, schedule?.get("startMinute")) {
+        mutableIntStateOf((schedule?.get("startMinute") as? Number)?.toInt() ?: 22 * 60)
+    }
+    var endMinute by remember(childId, schedule?.get("endMinute")) {
+        mutableIntStateOf((schedule?.get("endMinute") as? Number)?.toInt() ?: 7 * 60)
+    }
+    var scheduleDays by remember(childId, schedule?.get("days")) {
+        mutableStateOf(
+            (schedule?.get("days") as? List<*>)?.mapNotNull { (it as? Number)?.toInt() }?.toSet()
+                ?: setOf(2, 3, 4, 5, 6)
+        )
+    }
+    @Suppress("UNCHECKED_CAST")
+    val tvApps = childData?.get("tvApps") as? List<Map<String, Any>> ?: emptyList()
+    @Suppress("UNCHECKED_CAST")
+    val blockedTvApps = childData?.get("blockedTvApps") as? List<String> ?: emptyList()
+    val context = LocalContext.current
+    val tvUsageMinutes = (childData?.get("tvUsageMinutesToday") as? Number)?.toLong() ?: 0L
+
+    fun saveTvSchedule() {
+        db.collection("users").document(childId).set(
+            mapOf("tvScreenTimeSchedule" to mapOf(
+                "enabled" to scheduleEnabled,
+                "startMinute" to startMinute,
+                "endMinute" to endMinute,
+                "days" to scheduleDays.sorted()
+            )),
+            SetOptions.merge()
+        )
+    }
+
+    fun showTvTimePicker(initialMinute: Int, onSelected: (Int) -> Unit) {
+        TimePickerDialog(
+            context,
+            { _, hour, minute -> onSelected(hour * 60 + minute); saveTvSchedule() },
+            initialMinute / 60,
+            initialMinute % 60,
+            true
+        ).show()
+    }
 
     Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Text("Android TV Control", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
@@ -411,13 +459,83 @@ fun AndroidTvSection(childId: String, childData: Map<String, Any>?) {
                 Spacer(Modifier.height(16.dp))
                 
                 Text("TV Daily Time Limit", fontWeight = FontWeight.Bold)
-                Text("${tvTimeLimit / 60}h ${tvTimeLimit % 60}m allowed", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    if (tvTimeLimit == 0) "No daily limit" else "${tvTimeLimit / 60}h ${tvTimeLimit % 60}m allowed",
+                    style = MaterialTheme.typography.bodyMedium
+                )
                 Slider(
                     value = tvTimeLimit.toFloat(),
                     onValueChange = { tvTimeLimit = it.toInt() },
                     valueRange = 0f..480f,
                     onValueChangeFinished = {
                         db.collection("users").document(childId).set(mapOf("tvDailyTimeLimit" to tvTimeLimit), SetOptions.merge())
+                    }
+                )
+                Text("Set to 0 for no daily limit.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Spacer(Modifier.height(8.dp))
+                Text("TV usage today: ${tvUsageMinutes / 60}h ${tvUsageMinutes % 60}m", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+
+                HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Scheduled downtime", fontWeight = FontWeight.Bold)
+                        Text("Pause TV apps during sleep or school.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                    }
+                    Switch(
+                        checked = scheduleEnabled,
+                        onCheckedChange = {
+                            scheduleEnabled = it
+                            saveTvSchedule()
+                        }
+                    )
+                }
+                if (scheduleEnabled) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(onClick = { showTvTimePicker(startMinute) { startMinute = it } }, modifier = Modifier.weight(1f)) {
+                            Text("Start ${formatClockTime(startMinute)}")
+                        }
+                        OutlinedButton(onClick = { showTvTimePicker(endMinute) { endMinute = it } }, modifier = Modifier.weight(1f)) {
+                            Text("End ${formatClockTime(endMinute)}")
+                        }
+                    }
+                    Text("Choose days", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.fillMaxWidth()) {
+                        listOf("M" to 2, "T" to 3, "W" to 4, "T" to 5, "F" to 6, "S" to 7, "S" to 1).forEach { (label, day) ->
+                            FilterChip(
+                                selected = day in scheduleDays,
+                                onClick = {
+                                    scheduleDays = if (day in scheduleDays) scheduleDays - day else scheduleDays + day
+                                    saveTvSchedule()
+                                },
+                                label = { Text(label) }
+                            )
+                        }
+                    }
+                    Text("Calls and text messages stay available.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        Text("Allowed TV apps", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+        if (tvApps.isEmpty()) {
+            Text("Sync the TV to load its installed apps.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+        } else {
+            tvApps.take(80).forEach { app ->
+                val packageName = app["packageName"] as? String ?: return@forEach
+                val appName = app["name"] as? String ?: packageName
+                val isAllowed = packageName !in blockedTvApps
+                ListItem(
+                    headlineContent = { Text(appName) },
+                    supportingContent = { Text(packageName, fontSize = 10.sp, color = Color.Gray) },
+                    trailingContent = {
+                        Switch(
+                            checked = isAllowed,
+                            onCheckedChange = { allowed ->
+                                val newList = if (allowed) blockedTvApps.filter { it != packageName } else blockedTvApps + packageName
+                                db.collection("users").document(childId).set(mapOf("blockedTvApps" to newList), SetOptions.merge())
+                            }
+                        )
                     }
                 )
             }
@@ -598,14 +716,59 @@ fun LocationSection(childId: String, childData: Map<String, Any>?, onLiveLocatio
 }
 
 @Composable
+@OptIn(ExperimentalLayoutApi::class)
 fun ScreenTimeSection(childId: String, childData: Map<String, Any>?) {
     val db = FirebaseFirestore.getInstance()
-    var timeLimit by remember { mutableIntStateOf((childData?.get("dailyTimeLimit") as? Long)?.toInt() ?: 120) }
+    var timeLimit by remember(childId, childData?.get("dailyTimeLimit")) {
+        mutableIntStateOf((childData?.get("dailyTimeLimit") as? Number)?.toInt() ?: 120)
+    }
     val isLocked = childData?.get("locked") as? Boolean ?: false
+    val schedule = childData?.get("screenTimeSchedule") as? Map<*, *>
+    var scheduleEnabled by remember(childId, schedule?.get("enabled")) {
+        mutableStateOf(schedule?.get("enabled") as? Boolean ?: false)
+    }
+    var startMinute by remember(childId, schedule?.get("startMinute")) {
+        mutableIntStateOf((schedule?.get("startMinute") as? Number)?.toInt() ?: 22 * 60)
+    }
+    var endMinute by remember(childId, schedule?.get("endMinute")) {
+        mutableIntStateOf((schedule?.get("endMinute") as? Number)?.toInt() ?: 7 * 60)
+    }
+    var scheduleDays by remember(childId, schedule?.get("days")) {
+        mutableStateOf(
+            (schedule?.get("days") as? List<*>)?.mapNotNull { (it as? Number)?.toInt() }?.toSet()
+                ?: setOf(2, 3, 4, 5, 6)
+        )
+    }
+    val context = LocalContext.current
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    fun saveSchedule() {
+        db.collection("users").document(childId).set(
+            mapOf("screenTimeSchedule" to mapOf(
+                "enabled" to scheduleEnabled,
+                "startMinute" to startMinute,
+                "endMinute" to endMinute,
+                "days" to scheduleDays.sorted()
+            )),
+            SetOptions.merge()
+        )
+    }
+
+    fun showTimePicker(initialMinute: Int, onSelected: (Int) -> Unit) {
+        TimePickerDialog(
+            context,
+            { _, hour, minute -> onSelected(hour * 60 + minute); saveSchedule() },
+            initialMinute / 60,
+            initialMinute % 60,
+            true
+        ).show()
+    }
+
+    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Text("Daily Time Limit", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        Text("${timeLimit / 60}h ${timeLimit % 60}m allowed per day", style = MaterialTheme.typography.bodyLarge)
+        Text(
+            if (timeLimit == 0) "No daily limit" else "${timeLimit / 60}h ${timeLimit % 60}m allowed per day",
+            style = MaterialTheme.typography.bodyLarge
+        )
         
         Slider(
             value = timeLimit.toFloat(),
@@ -613,6 +776,50 @@ fun ScreenTimeSection(childId: String, childData: Map<String, Any>?) {
             valueRange = 0f..480f,
             onValueChangeFinished = { db.collection("users").document(childId).set(mapOf("dailyTimeLimit" to timeLimit), SetOptions.merge()) }
         )
+
+        Text("Set to 0 for no daily limit. Calls and text messages remain available.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+
+        Spacer(Modifier.height(24.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(16.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Scheduled downtime", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text("Pause entertainment apps during sleep or school.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            }
+            Switch(
+                checked = scheduleEnabled,
+                onCheckedChange = {
+                    scheduleEnabled = it
+                    saveSchedule()
+                }
+            )
+        }
+
+        if (scheduleEnabled) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(onClick = { showTimePicker(startMinute) { startMinute = it } }, modifier = Modifier.weight(1f)) {
+                    Text("Start ${formatClockTime(startMinute)}")
+                }
+                OutlinedButton(onClick = { showTimePicker(endMinute) { endMinute = it } }, modifier = Modifier.weight(1f)) {
+                    Text("End ${formatClockTime(endMinute)}")
+                }
+            }
+            Text("Choose days", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 12.dp, bottom = 4.dp))
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.fillMaxWidth()) {
+                listOf("M" to 2, "T" to 3, "W" to 4, "T" to 5, "F" to 6, "S" to 7, "S" to 1).forEach { (label, day) ->
+                    FilterChip(
+                        selected = day in scheduleDays,
+                        onClick = {
+                            scheduleDays = if (day in scheduleDays) scheduleDays - day else scheduleDays + day
+                            saveSchedule()
+                        },
+                        label = { Text(label) }
+                    )
+                }
+            }
+            Text("Overnight schedules can cross midnight. Calls and text messages stay available.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+        }
         
         Spacer(Modifier.height(32.dp))
         Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = if (isLocked) Color(0xFFE8F5E9) else MaterialTheme.colorScheme.errorContainer)) {
@@ -627,6 +834,9 @@ fun ScreenTimeSection(childId: String, childData: Map<String, Any>?) {
         }
     }
 }
+
+private fun formatClockTime(totalMinutes: Int): String =
+    String.format(Locale.getDefault(), "%02d:%02d", totalMinutes / 60, totalMinutes % 60)
 
 @Composable
 fun TaskSection(childId: String, childData: Map<String, Any>?) {

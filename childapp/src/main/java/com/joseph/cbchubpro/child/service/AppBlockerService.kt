@@ -11,10 +11,13 @@ import android.media.RingtoneManager
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.os.Handler
+import android.os.Looper
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.ListenerRegistration
+import com.joseph.cbchubpro.child.ScreenTimePolicy
 import java.util.Calendar
 
 class AppBlockerService : AccessibilityService() {
@@ -26,11 +29,45 @@ class AppBlockerService : AccessibilityService() {
     private var isLocked = false
     private var isTvLocked = false
     private var blockAppInstalls = false
+    private var dailyTimeLimitMinutes = ScreenTimePolicy.DEFAULT_DAILY_LIMIT_MINUTES
+    private var screenTimeSchedule: Map<*, *>? = null
+    private var tvScreenTimeSchedule: Map<*, *>? = null
+    private var availablePackages = emptySet<String>()
+    private var cachedDailyUsageMillis = 0L
+    private var lastDailyUsageReadAt = 0L
+    private val homeScreenPackage: String? by lazy {
+        try {
+            packageManager.resolveActivity(
+                Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),
+                PackageManager.MATCH_DEFAULT_ONLY
+            )?.activityInfo?.packageName
+        } catch (_: Exception) {
+            null
+        }
+    }
     private var tvTimeLimitMinutes = 0L
     private var tvUsageTodayMinutes = 0L
     
     private var controlListener: ListenerRegistration? = null
     private var authListener: FirebaseAuth.AuthStateListener? = null
+    private val enforcementHandler = Handler(Looper.getMainLooper())
+    private val enforcementTask = object : Runnable {
+        override fun run() {
+            enforceForegroundRestrictions()
+            enforcementHandler.postDelayed(this, 30_000L)
+        }
+    }
+    private val tvUsageTask = object : Runnable {
+        override fun run() {
+            val uid = auth.currentUser?.uid
+            if (uid != null) {
+                tvUsageTodayMinutes = currentDailyUsageMinutes()
+                db.collection("users").document(uid).update("tvUsageMinutesToday", tvUsageTodayMinutes)
+                enforceForegroundRestrictions()
+            }
+            enforcementHandler.postDelayed(this, 60_000L)
+        }
+    }
 
     private val installerPackages = setOf(
         "com.android.packageinstaller", "com.google.android.packageinstaller",
@@ -46,12 +83,13 @@ class AppBlockerService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        availablePackages = ScreenTimePolicy.alwaysAvailablePackages(this)
         authListener = FirebaseAuth.AuthStateListener { it.currentUser?.uid?.let { uid -> listenToControlData(uid) } }
         auth.addAuthStateListener(authListener!!)
         auth.currentUser?.uid?.let { listenToControlData(it) }
+        enforcementHandler.post(enforcementTask)
         
-        // Start Usage Tracker for TV
-        if (isTv()) startTvUsageTracker()
+        if (isTv()) enforcementHandler.post(tvUsageTask)
     }
 
     private fun listenToControlData(uid: String) {
@@ -64,14 +102,16 @@ class AppBlockerService : AccessibilityService() {
                     isLocked = snapshot.getBoolean("locked") ?: false
                     isTvLocked = snapshot.getBoolean("tvLocked") ?: false
                     blockAppInstalls = snapshot.getBoolean("blockAppInstalls") ?: false
+                    dailyTimeLimitMinutes = snapshot.getLong("dailyTimeLimit")
+                        ?: ScreenTimePolicy.DEFAULT_DAILY_LIMIT_MINUTES
+                    screenTimeSchedule = snapshot.get("screenTimeSchedule") as? Map<*, *>
+                    tvScreenTimeSchedule = snapshot.get("tvScreenTimeSchedule") as? Map<*, *>
                     tvTimeLimitMinutes = snapshot.getLong("tvDailyTimeLimit") ?: 120L
                     
                     // Fetch usage from snapshot if present
                     tvUsageTodayMinutes = snapshot.getLong("tvUsageMinutesToday") ?: 0L
 
-                    if (isLocked || (isTv() && (isTvLocked || (tvTimeLimitMinutes > 0 && tvUsageTodayMinutes >= tvTimeLimitMinutes)))) {
-                        blockAccess()
-                    }
+                    enforceForegroundRestrictions()
                     
                     if (snapshot.contains("loudSignalTrigger")) {
                         playLoudSignal()
@@ -81,51 +121,26 @@ class AppBlockerService : AccessibilityService() {
             }
     }
 
-    private fun startTvUsageTracker() {
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(object : Runnable {
-            override fun run() {
-                val uid = auth.currentUser?.uid
-                if (uid != null && !isTvLocked && !isLocked) {
-                    // Only count if an app is actually in foreground (not the launcher)
-                    if (isForegroundAppActive()) {
-                        tvUsageTodayMinutes++
-                        db.collection("users").document(uid).update("tvUsageMinutesToday", tvUsageTodayMinutes)
-                        
-                        if (tvTimeLimitMinutes > 0 && tvUsageTodayMinutes >= tvTimeLimitMinutes) {
-                            blockAccess()
-                        }
-                    }
-                }
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(this, 60000) // Check every minute
-            }
-        }, 60000)
-    }
-
-    private fun isForegroundAppActive(): Boolean {
-        // Logic to detect if a non-system/non-launcher app is active
-        // For simplicity on TV, we check if the current window is NOT the home screen
-        return true // Simplified for accessibility context
-    }
-
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val isDeviceTv = isTv()
-        
-        // 1. Enforce Locks
-        if (isLocked || (isDeviceTv && (isTvLocked || (tvTimeLimitMinutes > 0 && tvUsageTodayMinutes >= tvTimeLimitMinutes)))) {
+
+        val packageName = event.packageName?.toString() ?: return
+        if (isAlwaysAvailable(packageName) || isHomeScreen(packageName)) return
+
+        // Apply daily limits, scheduled downtime, and parent-initiated locks on the child device.
+        if (isRestrictionActive(isDeviceTv)) {
             blockAccess()
             return
         }
 
-        val packageName = event.packageName?.toString() ?: ""
-
-        // 2. Block Restricted Apps
+        // Explicitly blocked apps remain blocked even outside scheduled downtime.
         if (blockedPackages.contains(packageName) || (isDeviceTv && blockedTvApps.contains(packageName))) {
             blockAccess()
             return
         }
 
-        // 3. Block Installations
+        // Block Installations
         if (blockAppInstalls && installerPackages.contains(packageName)) {
             val rootNode = rootInActiveWindow ?: event.source
             if (shouldBlockInstallation(rootNode, packageName)) {
@@ -133,6 +148,42 @@ class AppBlockerService : AccessibilityService() {
                 return
             }
         }
+    }
+
+    private fun isAlwaysAvailable(candidate: String): Boolean =
+        candidate in availablePackages
+
+    private fun isHomeScreen(candidate: String): Boolean = candidate == homeScreenPackage
+
+    private fun isRestrictionActive(isDeviceTv: Boolean = isTv()): Boolean {
+        if (isLocked) return true
+        if (isDeviceTv) {
+            val scheduleActive = ScreenTimePolicy.isScheduleActive(tvScreenTimeSchedule)
+            val limitReached = tvTimeLimitMinutes > 0 && currentDailyUsageMinutes() >= tvTimeLimitMinutes
+            return isTvLocked || scheduleActive || limitReached
+        }
+        val scheduleActive = ScreenTimePolicy.isScheduleActive(screenTimeSchedule)
+        val limitReached = dailyTimeLimitMinutes > 0 && isDailyLimitReached()
+        return scheduleActive || limitReached
+    }
+
+    private fun isDailyLimitReached(): Boolean {
+        return dailyTimeLimitMinutes > 0 && currentDailyUsageMinutes() >= dailyTimeLimitMinutes
+    }
+
+    private fun currentDailyUsageMinutes(): Long {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastDailyUsageReadAt >= 30_000L || now < lastDailyUsageReadAt) {
+            cachedDailyUsageMillis = ScreenTimePolicy.todayUsageMillis(this)
+            lastDailyUsageReadAt = now
+        }
+        return cachedDailyUsageMillis / 60_000L
+    }
+
+    private fun enforceForegroundRestrictions() {
+        val foregroundPackage = rootInActiveWindow?.packageName?.toString() ?: return
+        if (isAlwaysAvailable(foregroundPackage) || isHomeScreen(foregroundPackage)) return
+        if (isRestrictionActive()) blockAccess()
     }
 
     private fun shouldBlockInstallation(root: AccessibilityNodeInfo?, pkg: String): Boolean {
@@ -170,6 +221,8 @@ class AppBlockerService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        enforcementHandler.removeCallbacks(enforcementTask)
+        enforcementHandler.removeCallbacks(tvUsageTask)
         authListener?.let { auth.removeAuthStateListener(it) }
         controlListener?.remove()
         mediaPlayer?.release()

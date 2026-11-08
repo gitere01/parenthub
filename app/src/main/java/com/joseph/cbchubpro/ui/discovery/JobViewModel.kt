@@ -43,6 +43,18 @@ data class JobPost(
     val createdAt: com.google.firebase.Timestamp? = null
 )
 
+data class JobApplication(
+    val id: String = "",
+    val jobId: String = "",
+    val jobTitle: String = "",
+    val company: String = "",
+    val applicantId: String = "",
+    val applicantName: String = "",
+    val applicantEmail: String = "",
+    val message: String = "",
+    val createdAt: com.google.firebase.Timestamp? = null
+)
+
 class JobViewModel : ViewModel() {
     private val db = FirebaseFirestore.getInstance()
     private val auth = FirebaseAuth.getInstance()
@@ -73,6 +85,9 @@ class JobViewModel : ViewModel() {
 
     private val _statusMessage = MutableStateFlow<String?>(null)
     val statusMessage = _statusMessage.asStateFlow()
+
+    private val _applications = MutableStateFlow<List<JobApplication>>(emptyList())
+    val applications = _applications.asStateFlow()
 
     init {
         fetchJobs()
@@ -145,6 +160,38 @@ class JobViewModel : ViewModel() {
             } catch (e: Exception) {
                 _statusMessage.value = "Error: ${e.message}"
             }
+        }
+    }
+
+    fun applyToJob(job: JobPost, message: String) {
+        val user = auth.currentUser
+        if (user == null) { _statusMessage.value = "Sign in to apply for this job."; return }
+        viewModelScope.launch {
+            try {
+                val existing = db.collection("job_applications").whereEqualTo("jobId", job.id)
+                    .whereEqualTo("applicantId", user.uid).get().await()
+                if (!existing.isEmpty) {
+                    _statusMessage.value = "You have already applied for this job."
+                    return@launch
+                }
+                db.collection("job_applications").add(JobApplication(
+                    jobId = job.id, jobTitle = job.title, company = job.company,
+                    applicantId = user.uid, applicantName = user.displayName ?: "Applicant",
+                    applicantEmail = user.email ?: "", message = message,
+                    createdAt = com.google.firebase.Timestamp.now()
+                )).await()
+                _statusMessage.value = "Application sent to ${job.company}."
+            } catch (e: Exception) { _statusMessage.value = "Could not send application: ${e.message ?: "Please try again."}" }
+        }
+    }
+
+    fun loadApplications(jobId: String) {
+        viewModelScope.launch {
+            try {
+                val snapshot = db.collection("job_applications").whereEqualTo("jobId", jobId).get().await()
+                _applications.value = snapshot.documents.mapNotNull { it.toObject(JobApplication::class.java)?.copy(id = it.id) }
+                    .sortedByDescending { it.createdAt }
+            } catch (e: Exception) { _statusMessage.value = "Could not load applications: ${e.message ?: "Please try again."}" }
         }
     }
 

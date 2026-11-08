@@ -43,6 +43,7 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.FirebaseFirestore
 import com.joseph.cbchubpro.ui.management.*
 import java.util.Locale
 
@@ -1128,6 +1129,9 @@ fun JobsScreen(
     var editingJob by remember { mutableStateOf<JobPost?>(null) }
     var showPayDialog by remember { mutableStateOf<JobPost?>(null) }
     var showBoostDialog by remember { mutableStateOf<JobPost?>(null) }
+    var applyingToJob by remember { mutableStateOf<JobPost?>(null) }
+    var viewingApplicationsFor by remember { mutableStateOf<JobPost?>(null) }
+    val applications by viewModel.applications.collectAsState()
     
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(statusMessage) {
@@ -1206,7 +1210,9 @@ fun JobsScreen(
                         onEdit = { editingJob = job },
                         onDelete = { viewModel.deleteJob(job.id) },
                         onVerify = { showPayDialog = job },
-                        onBoost = { showBoostDialog = job }
+                        onBoost = { showBoostDialog = job },
+                        onApply = { applyingToJob = job },
+                        onViewApplications = { viewingApplicationsFor = job; viewModel.loadApplications(job.id) }
                     )
                 }
             }
@@ -1256,6 +1262,33 @@ fun JobsScreen(
             }
         )
     }
+    applyingToJob?.let { job ->
+        JobApplicationDialog(job, onDismiss = { applyingToJob = null }) { message ->
+            viewModel.applyToJob(job, message)
+            applyingToJob = null
+        }
+    }
+    viewingApplicationsFor?.let { job ->
+        AlertDialog(
+            onDismissRequest = { viewingApplicationsFor = null },
+            title = { Text("Applications · ${job.title}") },
+            text = {
+                if (applications.isEmpty()) Text("No applications yet.") else Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    applications.forEach { application ->
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(application.applicantName, fontWeight = FontWeight.Bold)
+                                Text(application.applicantEmail, style = MaterialTheme.typography.bodySmall)
+                                if (application.message.isNotBlank()) Text(application.message, style = MaterialTheme.typography.bodyMedium)
+                                Text(application.createdAt?.toDate()?.toString()?.take(16) ?: "Recently", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { viewingApplicationsFor = null }) { Text("Done") } }
+        )
+    }
 }
 
 @Composable
@@ -1294,7 +1327,7 @@ fun BoostOptionCard(title: String, desc: String, price: String, onClick: () -> U
 }
 
 @Composable
-fun JobCard(job: JobPost, isOwner: Boolean, onEdit: () -> Unit, onDelete: () -> Unit, onVerify: () -> Unit, onBoost: () -> Unit) {
+fun JobCard(job: JobPost, isOwner: Boolean, onEdit: () -> Unit, onDelete: () -> Unit, onVerify: () -> Unit, onBoost: () -> Unit, onApply: () -> Unit, onViewApplications: () -> Unit) {
     val borderColor = when(job.boostLevel) {
         BoostLevel.TOP_PRIORITY -> Color(0xFFFFB300)
         BoostLevel.FEATURED -> MaterialTheme.colorScheme.primary
@@ -1354,6 +1387,7 @@ fun JobCard(job: JobPost, isOwner: Boolean, onEdit: () -> Unit, onDelete: () -> 
                 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     if (isOwner) {
+                        TextButton(onClick = onViewApplications) { Text("Applications") }
                         if (!job.isVerified && !job.verificationPending) {
                             TextButton(onClick = onVerify) { Text("Verify (100/-)", fontSize = 12.sp) }
                         }
@@ -1367,7 +1401,7 @@ fun JobCard(job: JobPost, isOwner: Boolean, onEdit: () -> Unit, onDelete: () -> 
                             Icon(Icons.Default.Delete, contentDescription = "Delete Job", tint = Color.Red, modifier = Modifier.size(20.dp))
                         }
                     } else {
-                        Button(onClick = { /* Apply or contact */ }, shape = RoundedCornerShape(8.dp)) {
+                        Button(onClick = onApply, shape = RoundedCornerShape(8.dp)) {
                             Text("Apply Now")
                         }
                     }
@@ -1375,6 +1409,23 @@ fun JobCard(job: JobPost, isOwner: Boolean, onEdit: () -> Unit, onDelete: () -> 
             }
         }
     }
+}
+
+@Composable
+private fun JobApplicationDialog(job: JobPost, onDismiss: () -> Unit, onSubmit: (String) -> Unit) {
+    var message by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Apply to ${job.company}") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Your name and email from your account will be shared with the employer.", style = MaterialTheme.typography.bodySmall)
+                OutlinedTextField(message, { message = it }, label = { Text("Short introduction (optional)") }, minLines = 3)
+            }
+        },
+        confirmButton = { Button(onClick = { onSubmit(message.trim()) }) { Text("Send application") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
 
 @Composable
@@ -1446,6 +1497,7 @@ fun ProfessionalDetailScreen(
     val profReviews = reviews[professionalId] ?: emptyList()
 
     var showReviewDialog by remember { mutableStateOf(false) }
+    var showBookingDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(professionalId) {
         viewModel.fetchReviews(professionalId)
@@ -1526,10 +1578,7 @@ fun ProfessionalDetailScreen(
 
                     Spacer(modifier = Modifier.height(32.dp))
                     Button(
-                        onClick = { 
-                            viewModel.initiateBookingPayment(prof, prof.contact) { _ ->
-                            }
-                        },
+                        onClick = { showBookingDialog = true },
                         modifier = Modifier.fillMaxWidth().height(56.dp),
                         shape = RoundedCornerShape(12.dp)
                     ) {
@@ -1546,6 +1595,43 @@ fun ProfessionalDetailScreen(
             showReviewDialog = false
         })
     }
+    if (showBookingDialog && prof != null) {
+        AppointmentRequestDialog(
+            providerContact = prof.contact,
+            onDismiss = { showBookingDialog = false },
+            onConfirm = { phone, date, time, notes ->
+                viewModel.initiateBookingPayment(prof, phone, date, time, notes) { }
+                showBookingDialog = false
+            }
+        )
+    }
+}
+
+@Composable
+private fun AppointmentRequestDialog(
+    providerContact: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String, String, String, String) -> Unit
+) {
+    var phone by remember { mutableStateOf(providerContact) }
+    var date by remember { mutableStateOf("") }
+    var time by remember { mutableStateOf("") }
+    var notes by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Request an appointment") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Choose a preferred time. The provider will see your request and can confirm or decline it.", style = MaterialTheme.typography.bodySmall)
+                OutlinedTextField(phone, { phone = it }, label = { Text("Your phone number") }, singleLine = true)
+                OutlinedTextField(date, { date = it }, label = { Text("Preferred date (e.g. 20 Nov 2026)") }, singleLine = true)
+                OutlinedTextField(time, { time = it }, label = { Text("Preferred time") }, singleLine = true)
+                OutlinedTextField(notes, { notes = it }, label = { Text("What do you need? (optional)") }, minLines = 2)
+            }
+        },
+        confirmButton = { Button(onClick = { onConfirm(phone.trim(), date.trim(), time.trim(), notes.trim()) }, enabled = phone.isNotBlank() && date.isNotBlank() && time.isNotBlank()) { Text("Send request") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
 
 @Composable
@@ -1828,12 +1914,35 @@ fun ProductDetailCard(
 }
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 fun SwapRequestDialog(
     targetProduct: ProductItem,
     onDismiss: () -> Unit,
     onSubmit: (String?, Double) -> Unit
 ) {
     var cashTopUp by remember { mutableStateOf("") }
+    var offeredItems by remember { mutableStateOf<List<ProductItem>>(emptyList()) }
+    var selectedOfferedItem by remember { mutableStateOf<ProductItem?>(null) }
+    var offeredMenuExpanded by remember { mutableStateOf(false) }
+    val uid = FirebaseAuth.getInstance().currentUser?.uid
+
+    DisposableEffect(uid) {
+        val listener = if (!uid.isNullOrBlank()) {
+            FirebaseFirestore.getInstance().collection("users").document(uid).collection("products")
+                .whereEqualTo("isForSwap", true)
+                .addSnapshotListener { snapshot, _ ->
+                    val availableItems = snapshot?.documents?.mapNotNull { document ->
+                        document.toObject(ProductItem::class.java)?.copy(id = document.id)
+                    }?.filter { it.status.equals("Available", ignoreCase = true) }.orEmpty()
+                    offeredItems = availableItems
+                    val selectedId = selectedOfferedItem?.id
+                    if (selectedId != null && availableItems.none { it.id == selectedId }) selectedOfferedItem = null
+                }
+        } else null
+        onDispose { listener?.remove() }
+    }
+    val cashOffer = cashTopUp.toDoubleOrNull() ?: 0.0
+    val hasOffer = selectedOfferedItem != null || cashOffer > 0.0
     
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1845,18 +1954,53 @@ fun SwapRequestDialog(
                 Text("Value: KES ${targetProduct.price}", style = MaterialTheme.typography.bodySmall)
                 
                 HorizontalDivider()
+
+                Text("What are you offering?", style = MaterialTheme.typography.labelLarge)
+                ExposedDropdownMenuBox(
+                    expanded = offeredMenuExpanded,
+                    onExpandedChange = { offeredMenuExpanded = it }
+                ) {
+                    OutlinedTextField(
+                        value = selectedOfferedItem?.name ?: "Choose one of your items",
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("Your swap item") },
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = offeredMenuExpanded) },
+                        modifier = Modifier.menuAnchor().fillMaxWidth()
+                    )
+                    ExposedDropdownMenu(
+                        expanded = offeredMenuExpanded,
+                        onDismissRequest = { offeredMenuExpanded = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("No item offer") },
+                            onClick = { selectedOfferedItem = null; offeredMenuExpanded = false }
+                        )
+                        offeredItems.forEach { item ->
+                            DropdownMenuItem(
+                                text = { Text("${item.name} • KES ${item.price}") },
+                                onClick = { selectedOfferedItem = item; offeredMenuExpanded = false }
+                            )
+                        }
+                    }
+                }
+                if (offeredItems.isEmpty()) {
+                    Text("You have no available swap listings yet. You can still offer a cash top-up.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                }
                 
                 Text("Offer a cash top-up (optional):", style = MaterialTheme.typography.labelSmall)
                 OutlinedTextField(
                     value = cashTopUp,
-                    onValueChange = { cashTopUp = it },
+                    onValueChange = { input -> if (input.isEmpty() || input.matches(Regex("^\\d{0,8}(\\.\\d{0,2})?$"))) cashTopUp = input },
                     label = { Text("Cash Amount (KES)") },
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
                 )
+                if (!hasOffer) Text("Choose an item or add a cash offer to send a request.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
         },
         confirmButton = {
-            Button(onClick = { onSubmit(null, cashTopUp.toDoubleOrNull() ?: 0.0) }) {
+            Button(onClick = { onSubmit(selectedOfferedItem?.id, cashOffer) }, enabled = hasOffer) {
                 Text("Send Request")
             }
         },

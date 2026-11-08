@@ -79,11 +79,9 @@ class ServiceViewModel : ViewModel() {
             }
     }
 
-    fun updateBookingStatus(bookingId: String, newStatus: OrderStatus) {
+    fun updateAppointmentStatus(bookingId: String, status: String) {
         viewModelScope.launch {
-            try {
-                db.collection("service_bookings").document(bookingId).update("status", newStatus).await()
-            } catch (e: Exception) {}
+            try { db.collection("service_bookings").document(bookingId).update("bookingStatus", status).await() } catch (_: Exception) { }
         }
     }
 
@@ -159,7 +157,10 @@ data class ServiceBooking(
     val amount: Double = 0.0,
     val status: OrderStatus = OrderStatus.PENDING,
     val createdAt: com.google.firebase.Timestamp = com.google.firebase.Timestamp.now(),
-    val notes: String = ""
+    val notes: String = "",
+    val appointmentDate: String = "",
+    val appointmentTime: String = "",
+    val bookingStatus: String = "REQUESTED"
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -188,7 +189,7 @@ fun ServiceManagementScreen(onLogoutClicked: () -> Unit, viewModel: ServiceViewM
             TabRow(selectedTabIndex = selectedTab) {
                 Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("My Profile") })
                 Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { 
-                    BadgedBox(badge = { if(bookings.any { it.status == OrderStatus.PAID }) Badge { Text(bookings.count { it.status == OrderStatus.PAID }.toString()) } }) {
+                    BadgedBox(badge = { if(bookings.any { it.bookingStatus == "REQUESTED" }) Badge { Text(bookings.count { it.bookingStatus == "REQUESTED" }.toString()) } }) {
                         Text("Bookings")
                     }
                 })
@@ -209,13 +210,13 @@ fun BookingsTab(bookings: List<ServiceBooking>, viewModel: ServiceViewModel) {
             item { Box(modifier = Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) { Text("No bookings yet", color = Color.Gray) } }
         }
         items(bookings) { booking ->
-            BookingCard(booking, onUpdateStatus = { viewModel.updateBookingStatus(booking.id, it) })
+            BookingCard(booking, onUpdateAppointment = { viewModel.updateAppointmentStatus(booking.id, it) })
         }
     }
 }
 
 @Composable
-fun BookingCard(booking: ServiceBooking, onUpdateStatus: (OrderStatus) -> Unit) {
+fun BookingCard(booking: ServiceBooking, onUpdateAppointment: (String) -> Unit) {
     Card(modifier = Modifier.fillMaxWidth().shadow(2.dp, RoundedCornerShape(12.dp))) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -223,10 +224,14 @@ fun BookingCard(booking: ServiceBooking, onUpdateStatus: (OrderStatus) -> Unit) 
                     Text(booking.serviceName, fontWeight = FontWeight.Bold)
                     Text(booking.createdAt.toDate().toString().take(16), style = MaterialTheme.typography.labelSmall, color = Color.Gray)
                 }
-                StatusBadge(booking.status)
+                Surface(color = when (booking.bookingStatus) { "CONFIRMED" -> Color(0xFFE8F5E9); "DECLINED" -> Color(0xFFFFEBEE); else -> MaterialTheme.colorScheme.secondaryContainer }, shape = RoundedCornerShape(8.dp)) {
+                    Text(booking.bookingStatus.lowercase().replaceFirstChar { it.uppercase() }, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), style = MaterialTheme.typography.labelMedium)
+                }
             }
             
             HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+
+            Text("Requested: ${booking.appointmentDate} at ${booking.appointmentTime}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
             
             Text("Client Details", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
             Text(booking.buyerName, style = MaterialTheme.typography.bodyMedium)
@@ -247,10 +252,16 @@ fun BookingCard(booking: ServiceBooking, onUpdateStatus: (OrderStatus) -> Unit) 
                 Text("KES ${booking.amount}", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
             }
 
-            if (booking.status == OrderStatus.PAID) {
+            if (booking.bookingStatus == "REQUESTED") {
+                Spacer(Modifier.height(12.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(onClick = { onUpdateAppointment("DECLINED") }, modifier = Modifier.weight(1f)) { Text("Decline") }
+                    Button(onClick = { onUpdateAppointment("CONFIRMED") }, modifier = Modifier.weight(1f)) { Text("Confirm") }
+                }
+            } else if (booking.bookingStatus == "CONFIRMED") {
                 Spacer(Modifier.height(16.dp))
                 Button(
-                    onClick = { onUpdateStatus(OrderStatus.COMPLETED) },
+                    onClick = { onUpdateAppointment("COMPLETED") },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
                 ) {
@@ -258,8 +269,8 @@ fun BookingCard(booking: ServiceBooking, onUpdateStatus: (OrderStatus) -> Unit) 
                     Spacer(Modifier.width(8.dp))
                     Text("Service Delivered")
                 }
-                Text("Funds have been paid and are awaiting delivery confirmation.", style = MaterialTheme.typography.labelSmall, color = Color.Gray, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
-            } else if (booking.status == OrderStatus.COMPLETED) {
+                Text("Appointment is confirmed. Contact the client if you need to adjust the time.", style = MaterialTheme.typography.labelSmall, color = Color.Gray, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
+            } else if (booking.bookingStatus == "COMPLETED") {
                 Spacer(Modifier.height(8.dp))
                 Surface(color = Color(0xFF4CAF50).copy(alpha = 0.1f), shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
                     Text("Service completed!", modifier = Modifier.padding(8.dp), style = MaterialTheme.typography.labelSmall, color = Color(0xFF4CAF50), textAlign = TextAlign.Center)

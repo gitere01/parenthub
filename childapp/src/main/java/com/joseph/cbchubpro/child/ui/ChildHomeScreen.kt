@@ -63,6 +63,7 @@ import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.SetOptions
 import com.joseph.cbchubpro.child.AppListFetcher
+import com.joseph.cbchubpro.child.ScreenTimePolicy
 import com.joseph.cbchubpro.child.data.local.ChildDataRepository
 import com.joseph.cbchubpro.child.data.model.*
 import com.joseph.cbchubpro.child.receiver.AppDeviceAdminReceiver
@@ -111,6 +112,9 @@ class ChildHomeViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val _pointsBalance = MutableStateFlow(0L)
     val pointsBalance = _pointsBalance.asStateFlow()
+
+    private val _screenTimeUsedMillis = MutableStateFlow(0L)
+    val screenTimeUsedMillis = _screenTimeUsedMillis.asStateFlow()
 
     private val _isLoading = MutableStateFlow(true)
     val isLoading = _isLoading.asStateFlow()
@@ -218,8 +222,15 @@ class ChildHomeViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             while (true) {
                 reportPermissionsStatus()
+                refreshScreenTimeUsage()
                 delay(60000)
             }
+        }
+    }
+
+    private fun refreshScreenTimeUsage() {
+        if (_isUsageGranted.value) {
+            _screenTimeUsedMillis.value = ScreenTimePolicy.todayUsageMillis(getApplication())
         }
     }
 
@@ -384,10 +395,17 @@ fun ChildHomeScreen(
     val behaviors by viewModel.behaviorLogs.collectAsState()
     val submissions by viewModel.submissions.collectAsState()
     val points by viewModel.pointsBalance.collectAsState()
+    val screenTimeUsedMillis by viewModel.screenTimeUsedMillis.collectAsState()
+    val isUsageGranted by viewModel.isUsageGranted.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
     val isUnpaired by viewModel.isUnpaired.collectAsState()
     val showPermissionsSetup by viewModel.showPermissionsSetup.collectAsState()
+    val context = LocalContext.current
+    val isTvDevice = remember(context) {
+        context.packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
+            context.packageManager.hasSystemFeature(PackageManager.FEATURE_TELEVISION)
+    }
 
     var showLogoutDialog by remember { mutableStateOf(false) }
 
@@ -459,6 +477,20 @@ fun ChildHomeScreen(
                         grade = profile["gradeLevel"]?.toString() ?: "N/A",
                         points = points,
                         onPointsClick = onNavigateToLeaderboard
+                    )
+                }
+
+                item {
+                    ChildScreenTimeCard(
+                        title = if (isTvDevice) "My TV time" else "My screen time",
+                        usedMillis = screenTimeUsedMillis,
+                        usageAccessGranted = isUsageGranted,
+                        dailyLimitMinutes = if (isTvDevice) {
+                            (profile["tvDailyTimeLimit"] as? Number)?.toLong() ?: ScreenTimePolicy.DEFAULT_DAILY_LIMIT_MINUTES
+                        } else {
+                            (profile["dailyTimeLimit"] as? Number)?.toLong() ?: ScreenTimePolicy.DEFAULT_DAILY_LIMIT_MINUTES
+                        },
+                        schedule = profile[if (isTvDevice) "tvScreenTimeSchedule" else "screenTimeSchedule"] as? Map<*, *>
                     )
                 }
 
@@ -538,6 +570,54 @@ fun ChildHomeScreen(
             }
         }
     }
+}
+
+@Composable
+private fun ChildScreenTimeCard(title: String, usedMillis: Long, usageAccessGranted: Boolean, dailyLimitMinutes: Long, schedule: Map<*, *>?) {
+    val usedMinutes = usedMillis / 60_000L
+    val remainingMinutes = (dailyLimitMinutes - usedMinutes).coerceAtLeast(0L)
+    val scheduleActive = ScreenTimePolicy.isScheduleActive(schedule)
+    val isUnlimited = dailyLimitMinutes <= 0L
+    val progress = if (isUnlimited) 0f else (usedMinutes.toFloat() / dailyLimitMinutes).coerceIn(0f, 1f)
+    val startMinute = (schedule?.get("startMinute") as? Number)?.toInt() ?: 22 * 60
+    val endMinute = (schedule?.get("endMinute") as? Number)?.toInt() ?: 7 * 60
+
+    ElevatedCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text(
+                when {
+                    scheduleActive -> "Scheduled downtime is active"
+                    isUnlimited -> "No daily time limit set"
+                    else -> "${formatScreenTime(remainingMinutes)} left today"
+                },
+                style = MaterialTheme.typography.headlineSmall,
+                color = if (scheduleActive || (!isUnlimited && remainingMinutes == 0L)) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.Bold
+            )
+            if (!isUnlimited) {
+                LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+                Text("${formatScreenTime(usedMinutes)} used of ${formatScreenTime(dailyLimitMinutes)}", style = MaterialTheme.typography.bodySmall)
+            } else {
+                Text("${formatScreenTime(usedMinutes)} used today", style = MaterialTheme.typography.bodySmall)
+            }
+            if (schedule?.get("enabled") == true) {
+                Text("Downtime: ${formatScreenClockTime(startMinute)}–${formatScreenClockTime(endMinute)}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            }
+            if (!usageAccessGranted) {
+                Text("Usage updates when Usage access is enabled.", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+            }
+        }
+    }
+}
+
+private fun formatScreenClockTime(totalMinutes: Int): String =
+    String.format(Locale.getDefault(), "%02d:%02d", totalMinutes / 60, totalMinutes % 60)
+
+private fun formatScreenTime(minutes: Long): String {
+    val hours = minutes / 60
+    val remainder = minutes % 60
+    return if (hours > 0) "${hours}h ${remainder}m" else "${remainder}m"
 }
 
 @Composable

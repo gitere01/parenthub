@@ -217,13 +217,21 @@ data class SwapRequest(
     val receiverName: String = "",
     val requestedItemId: String = "",
     val offeredItemId: String? = null,
+    val requestedItemName: String = "",
+    val requestedItemImageUrl: String = "",
+    val requestedItemValue: Double = 0.0,
+    val offeredItemName: String = "",
+    val offeredItemImageUrl: String = "",
+    val offeredItemValue: Double = 0.0,
+    val senderConfirmed: Boolean = false,
+    val receiverConfirmed: Boolean = false,
     val cashOffered: Double = 0.0,
     val status: SwapRequestStatus = SwapRequestStatus.PENDING,
     val createdAt: Timestamp = Timestamp.now()
 )
 
 enum class SwapRequestStatus {
-    PENDING, ACCEPTED, REJECTED, COMPLETED
+    PENDING, ACCEPTED, REJECTED, COMPLETED, CANCELLED
 }
 
 enum class AdLevel {
