@@ -60,6 +60,8 @@ class PropertyViewModel : ViewModel() {
 
     private val _properties = MutableStateFlow<List<PropertyListing>>(emptyList())
     val properties = _properties.asStateFlow()
+    private val _inquiries = MutableStateFlow<List<PropertyInquiry>>(emptyList())
+    val inquiries = _inquiries.asStateFlow()
 
     private val _isUploading = MutableStateFlow(false)
     val isUploading = _isUploading.asStateFlow()
@@ -69,6 +71,25 @@ class PropertyViewModel : ViewModel() {
 
     init {
         fetchMyProperties()
+        fetchMyInquiries()
+    }
+
+    private fun fetchMyInquiries() {
+        val uid = auth.currentUser?.uid ?: return
+        db.collection("property_inquiries").whereEqualTo("agentId", uid)
+            .addSnapshotListener { snapshot, _ ->
+                _inquiries.value = snapshot?.documents?.mapNotNull { it.toObject(PropertyInquiry::class.java)?.copy(id = it.id) }
+                    ?.sortedByDescending { it.createdAt } ?: emptyList()
+            }
+    }
+
+    fun updateInquiryStatus(inquiryId: String, status: String) {
+        viewModelScope.launch {
+            try {
+                db.collection("property_inquiries").document(inquiryId).update("status", status).await()
+                _statusMessage.value = "Enquiry marked $status."
+            } catch (e: Exception) { _statusMessage.value = "Could not update enquiry: ${e.message ?: "Please try again."}" }
+        }
     }
 
     private fun fetchMyProperties() {
@@ -136,6 +157,15 @@ class PropertyViewModel : ViewModel() {
         }
     }
 
+    fun updateAvailability(propertyId: String, isAvailable: Boolean) {
+        viewModelScope.launch {
+            try {
+                db.collection("properties").document(propertyId).update("isAvailable", isAvailable).await()
+                _statusMessage.value = if (isAvailable) "Listing is live." else "Listing paused and hidden from discovery."
+            } catch (e: Exception) { _statusMessage.value = "Could not update listing: ${e.message ?: "Please try again."}" }
+        }
+    }
+
     private suspend fun uploadFile(context: Context, uri: Uri): String = withContext(Dispatchers.IO) {
         val uid = auth.currentUser?.uid ?: ""
         val fileName = "${UUID.randomUUID()}.jpg"
@@ -153,16 +183,32 @@ class PropertyViewModel : ViewModel() {
     fun clearStatus() { _statusMessage.value = null }
 }
 
+data class PropertyInquiry(
+    val id: String = "",
+    val propertyId: String = "",
+    val propertyTitle: String = "",
+    val propertyType: String = "",
+    val agentId: String = "",
+    val interestedUserName: String = "",
+    val interestedUserEmail: String = "",
+    val contact: String = "",
+    val message: String = "",
+    val status: String = "NEW",
+    val createdAt: com.google.firebase.Timestamp? = null
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PropertyManagementScreen(onLogoutClicked: () -> Unit, viewModel: PropertyViewModel = viewModel()) {
     val properties by viewModel.properties.collectAsState()
+    val inquiries by viewModel.inquiries.collectAsState()
     val isUploading by viewModel.isUploading.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     
     var showAddDialog by remember { mutableStateOf(false) }
     var editingProperty by remember { mutableStateOf<PropertyListing?>(null) }
+    var selectedTab by remember { mutableIntStateOf(0) }
     val context = LocalContext.current
 
     LaunchedEffect(statusMessage) {
@@ -185,24 +231,46 @@ fun PropertyManagementScreen(onLogoutClicked: () -> Unit, viewModel: PropertyVie
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = { showAddDialog = true }) {
+            if (selectedTab == 0) FloatingActionButton(onClick = { showAddDialog = true }) {
                 Icon(Icons.Default.Add, "Add Property")
             }
         }
     ) { padding ->
-        LazyColumn(
-            modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            if (properties.isEmpty()) {
-                item { Box(Modifier.fillParentMaxSize(), Alignment.Center) { Text("No properties listed yet.", color = Color.Gray) } }
+        Column(Modifier.fillMaxSize().padding(padding)) {
+            TabRow(selectedTabIndex = selectedTab) {
+                Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Listings (${properties.size})") })
+                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("Enquiries (${inquiries.count { it.status == "NEW" }})") })
             }
-            items(properties) { property ->
-                PropertyListingCard(
-                    property = property,
-                    onEdit = { editingProperty = property },
-                    onDelete = { viewModel.deleteProperty(property.id) }
-                )
+            if (selectedTab == 0) {
+                LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    if (properties.isEmpty()) item { Box(Modifier.fillParentMaxSize(), Alignment.Center) { Text("No properties listed yet.", color = Color.Gray) } }
+                    items(properties) { property -> PropertyListingCard(property, onEdit = { editingProperty = property }, onDelete = { viewModel.deleteProperty(property.id) }, onAvailabilityChange = { viewModel.updateAvailability(property.id, it) }) }
+                }
+            } else {
+                LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (inquiries.isEmpty()) item { Box(Modifier.fillParentMaxSize(), Alignment.Center) { Text("No enquiries yet.", color = Color.Gray) } }
+                    items(inquiries) { inquiry ->
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text(inquiry.propertyTitle, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                                    Text(inquiry.status, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                                }
+                                Text("${inquiry.propertyType} · ${inquiry.interestedUserName}", style = MaterialTheme.typography.bodyMedium)
+                                if (inquiry.interestedUserEmail.isNotBlank()) Text(inquiry.interestedUserEmail, style = MaterialTheme.typography.bodySmall)
+                                Text("Phone: ${inquiry.contact}", style = MaterialTheme.typography.bodyMedium)
+                                if (inquiry.message.isNotBlank()) Text(inquiry.message, style = MaterialTheme.typography.bodyMedium)
+                                Text(inquiry.createdAt?.toDate()?.toString()?.take(16) ?: "New", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                                if (inquiry.status != "CONTACTED" && inquiry.status != "CLOSED") {
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        OutlinedButton(onClick = { viewModel.updateInquiryStatus(inquiry.id, "CLOSED") }) { Text("Close") }
+                                        Button(onClick = { viewModel.updateInquiryStatus(inquiry.id, "CONTACTED") }) { Text("Mark contacted") }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -232,7 +300,7 @@ fun PropertyManagementScreen(onLogoutClicked: () -> Unit, viewModel: PropertyVie
 }
 
 @Composable
-fun PropertyListingCard(property: PropertyListing, onEdit: () -> Unit, onDelete: () -> Unit) {
+fun PropertyListingCard(property: PropertyListing, onEdit: () -> Unit, onDelete: () -> Unit, onAvailabilityChange: (Boolean) -> Unit) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column {
             Box(Modifier.height(180.dp).fillMaxWidth()) {
@@ -280,6 +348,10 @@ fun PropertyListingCard(property: PropertyListing, onEdit: () -> Unit, onDelete:
                 Text("KES ${property.price}", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                 Text("${property.type} - ${property.propertyCategory}", style = MaterialTheme.typography.bodySmall)
                 Text(property.location, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text(if (property.isAvailable) "Live on discovery" else "Paused", style = MaterialTheme.typography.labelMedium, color = if (property.isAvailable) Color(0xFF2E7D32) else Color.Gray)
+                    TextButton(onClick = { onAvailabilityChange(!property.isAvailable) }) { Text(if (property.isAvailable) "Pause" else "Publish") }
+                }
             }
         }
     }

@@ -783,11 +783,25 @@ fun VerificationSection(isPending: Boolean, viewModel: TeacherViewModel) {
 @Composable
 fun TeacherOverview(viewModel: TeacherViewModel) {
     val profile by viewModel.teacherProfile.collectAsState()
-    val points = profile["teacherPoints"] as? Long ?: 0L
+    val pointViewModel: PointViewModel = viewModel()
+    val pointBalance by pointViewModel.pointBalance.collectAsState()
+    val pointStatus by pointViewModel.transactionStatus.collectAsState()
+    val pointSnackbar = remember { SnackbarHostState() }
+    val points = pointBalance?.totalPoints ?: 0.0
     val lessons by viewModel.lessons.collectAsState()
     val submissions by viewModel.submissions.collectAsState()
+    var showRedeem by remember { mutableStateOf(false) }
 
-    Column(modifier = Modifier.padding(16.dp).verticalScroll(rememberScrollState())) {
+    LaunchedEffect(pointStatus) {
+        when (val state = pointStatus) {
+            is ActionResultState.Success -> { pointSnackbar.showSnackbar(state.message ?: "Done"); pointViewModel.resetStatus() }
+            is ActionResultState.Error -> { pointSnackbar.showSnackbar(state.message); pointViewModel.resetStatus() }
+            else -> Unit
+        }
+    }
+
+    Scaffold(snackbarHost = { SnackbarHost(pointSnackbar) }) { inset ->
+    Column(modifier = Modifier.padding(inset).padding(16.dp).verticalScroll(rememberScrollState())) {
         Card(modifier = Modifier.fillMaxWidth()) {
             Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(modifier = Modifier.size(60.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer), contentAlignment = Alignment.Center) {
@@ -797,7 +811,7 @@ fun TeacherOverview(viewModel: TeacherViewModel) {
                 Spacer(Modifier.width(16.dp))
                 Column {
                     Text(profile["name"]?.toString() ?: "Teacher", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text("Verified Professional • $points Points", color = Color(0xFF4CAF50), style = MaterialTheme.typography.labelSmall)
+                    Text("Verified Professional • ${"%.0f".format(points)} redeemable points", color = Color(0xFF4CAF50), style = MaterialTheme.typography.labelSmall)
                 }
             }
         }
@@ -806,7 +820,44 @@ fun TeacherOverview(viewModel: TeacherViewModel) {
             StatCard("Materials", lessons.size.toString(), Modifier.weight(1f))
             StatCard("Grading Pending", submissions.count { !it.graded }.toString(), Modifier.weight(1f))
         }
+        Spacer(Modifier.height(12.dp))
+        Button(onClick = { showRedeem = true }, enabled = points > 0.0, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Default.AccountBalanceWallet, null)
+            Spacer(Modifier.width(8.dp))
+            Text("Redeem points as cash")
+        }
+        Text("Cashout requests are sent to the platform payout queue. 1 point = KES 1.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
     }
+
+    if (showRedeem) {
+        RedeemTeacherPointsDialog(balance = points, onDismiss = { showRedeem = false }) { amount, phone ->
+            pointViewModel.requestRedemption(amount, phone)
+            showRedeem = false
+        }
+    }
+    }
+}
+
+@Composable
+private fun RedeemTeacherPointsDialog(balance: Double, onDismiss: () -> Unit, onConfirm: (Double, String) -> Unit) {
+    var amount by remember { mutableStateOf("") }
+    var phone by remember { mutableStateOf(FirebaseAuth.getInstance().currentUser?.phoneNumber.orEmpty()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Redeem teacher earnings") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Available: ${"%.0f".format(balance)} points · KES 1 per point")
+                OutlinedTextField(value = amount, onValueChange = { amount = it.filter(Char::isDigit) }, label = { Text("Points to redeem") })
+                OutlinedTextField(value = phone, onValueChange = { phone = it }, label = { Text("M-Pesa phone number") })
+            }
+        },
+        confirmButton = {
+            Button(onClick = { onConfirm(amount.toDoubleOrNull() ?: 0.0, phone.trim()) },
+                enabled = (amount.toDoubleOrNull() ?: 0.0) in 1.0..balance && phone.isNotBlank()) { Text("Request cashout") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
 
 @Composable

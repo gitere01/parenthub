@@ -185,6 +185,8 @@ class DiscoveryViewModel : ViewModel() {
     private fun filterVendorsByType(
         vendors: List<VendorWithProducts>, type: ListingType, search: String, location: String, sort: SortOrder, verified: Boolean
     ): List<VendorWithProducts> {
+        fun isPromotionActive(product: ProductItem): Boolean =
+            product.adStatus == AdStatus.ACTIVE && (product.adExpiresAt == null || product.adExpiresAt.toDate().time > System.currentTimeMillis())
         return vendors.asSequence()
             .filter { vendor ->
                 val matchesLocation = location.isEmpty() || vendor.location.contains(location, ignoreCase = true)
@@ -193,17 +195,25 @@ class DiscoveryViewModel : ViewModel() {
             }
             .map { vendor ->
                 val filteredProducts = vendor.products.filter { product ->
-                    product.listingType == type && (search.isEmpty() || product.name.contains(search, ignoreCase = true))
+                    product.listingType == type &&
+                        (search.isEmpty() || listOf(product.name, product.description, product.category, product.brand).any { it.contains(search, ignoreCase = true) } || product.tags.any { it.contains(search, ignoreCase = true) })
                 }.let { products ->
                     when (sort) {
-                        SortOrder.PRICE_LOW_HIGH -> products.sortedBy { it.price }
-                        SortOrder.PRICE_HIGH_LOW -> products.sortedByDescending { it.price }
-                        SortOrder.NONE -> products
+                        SortOrder.PRICE_LOW_HIGH -> products.sortedWith(compareByDescending<ProductItem> { isPromotionActive(it) }.thenBy { it.price })
+                        SortOrder.PRICE_HIGH_LOW -> products.sortedWith(compareByDescending<ProductItem> { isPromotionActive(it) }.thenByDescending { it.price })
+                        SortOrder.NONE -> products.sortedWith(
+                            compareByDescending<ProductItem> { isPromotionActive(it) }
+                                .thenByDescending { when (it.adLevel) { AdLevel.FEATURED -> 3; AdLevel.PREMIUM -> 2; AdLevel.BASIC -> 1; AdLevel.FREE -> 0 } }
+                        )
                     }
                 }
                 vendor.copy(products = filteredProducts)
             }
             .filter { it.products.isNotEmpty() }
+            .sortedWith(
+                compareByDescending<VendorWithProducts> { vendor -> vendor.products.any { isPromotionActive(it) } }
+                    .thenByDescending { vendor -> vendor.products.maxOfOrNull { product -> when (product.adLevel) { AdLevel.FEATURED -> 3; AdLevel.PREMIUM -> 2; AdLevel.BASIC -> 1; AdLevel.FREE -> 0 } } ?: 0 }
+            )
             .toList()
     }
 
@@ -275,8 +285,8 @@ class DiscoveryViewModel : ViewModel() {
                         pDoc.toObject(ProductItem::class.java)?.copy(id = pDoc.id)
                     } catch (e: Exception) { null }
                 }.filter { product ->
-                    role != "parent/guardian" ||
-                        (product.isForSwap && product.status.equals("Available", ignoreCase = true))
+                    if (role == "parent/guardian") product.isForSwap && product.status.equals("Available", ignoreCase = true)
+                    else product.status.equals("Available", ignoreCase = true) && product.stockQuantity != 0
                 }
 
             VendorWithProducts(
@@ -351,6 +361,35 @@ class DiscoveryViewModel : ViewModel() {
                     it.toObject(PropertyListing::class.java)?.copy(id = it.id)
                 } ?: emptyList()
             }
+    }
+
+    fun sendPropertyInquiry(property: PropertyListing, contact: String, message: String) {
+        val user = auth.currentUser
+        if (user == null) {
+            _statusMessage.value = "Sign in to contact the agent."
+            return
+        }
+        viewModelScope.launch {
+            try {
+                db.collection("property_inquiries").add(mapOf(
+                    "propertyId" to property.id,
+                    "propertyTitle" to property.title,
+                    "propertyType" to property.type,
+                    "agentId" to property.agentId,
+                    "agentName" to property.agentName,
+                    "interestedUserId" to user.uid,
+                    "interestedUserName" to (user.displayName ?: "Interested renter/buyer"),
+                    "interestedUserEmail" to (user.email ?: ""),
+                    "contact" to contact,
+                    "message" to message,
+                    "status" to "NEW",
+                    "createdAt" to com.google.firebase.Timestamp.now()
+                )).await()
+                _statusMessage.value = "Your enquiry was sent to ${property.agentName.ifBlank { "the agent" }}."
+            } catch (e: Exception) {
+                _statusMessage.value = "Could not send enquiry: ${e.message ?: "Please try again."}"
+            }
+        }
     }
 
     fun fetchRestaurantMenus() {

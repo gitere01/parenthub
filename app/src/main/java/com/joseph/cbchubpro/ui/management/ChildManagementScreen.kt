@@ -13,6 +13,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -26,14 +27,17 @@ import com.joseph.cbchubpro.ui.discovery.ProfessionalProfile
 fun ChildManagementScreen(
     childId: String,
     onBackClicked: () -> Unit,
-    discoveryViewModel: DiscoveryViewModel = viewModel()
+    discoveryViewModel: DiscoveryViewModel = viewModel(),
+    pointViewModel: PointViewModel = viewModel()
 ) {
-    val parentPoints by discoveryViewModel.pointsBalance.collectAsState()
+    val parentPointBalance by pointViewModel.pointBalance.collectAsState()
+    val parentPoints = parentPointBalance?.totalPoints ?: 0.0
     val childPoints by discoveryViewModel.childPointsBalance.collectAsState()
     val interactions by discoveryViewModel.interactions.collectAsState()
     val professionals by discoveryViewModel.professionals.collectAsState()
-    val status by discoveryViewModel.statusMessage.collectAsState()
+    val pointActionStatus by pointViewModel.transactionStatus.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
+    val uriHandler = LocalUriHandler.current
     
     var showBuyPoints by remember { mutableStateOf(false) }
 
@@ -42,10 +46,19 @@ fun ChildManagementScreen(
         discoveryViewModel.fetchInteractions(childId)
     }
 
-    LaunchedEffect(status) {
-        status?.let {
-            snackbarHostState.showSnackbar(it)
-            discoveryViewModel.clearStatus()
+    LaunchedEffect(pointActionStatus) {
+        when (val state = pointActionStatus) {
+            is ActionResultState.Success -> {
+                val result = state.message.orEmpty()
+                if (result.startsWith("https://")) runCatching { uriHandler.openUri(result) }
+                else snackbarHostState.showSnackbar(result)
+                pointViewModel.resetStatus()
+            }
+            is ActionResultState.Error -> {
+                snackbarHostState.showSnackbar(state.message)
+                pointViewModel.resetStatus()
+            }
+            else -> Unit
         }
     }
 
@@ -93,7 +106,7 @@ fun ChildManagementScreen(
                 Row(modifier = Modifier.padding(24.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("My Gifting Wallet", style = MaterialTheme.typography.labelMedium)
-                        Text("$parentPoints", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.ExtraBold)
+                        Text("${"%.0f".format(parentPoints)}", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.ExtraBold)
                     }
                     Button(
                         onClick = { showBuyPoints = true },
@@ -115,7 +128,7 @@ fun ChildManagementScreen(
                 interactions.forEach { record ->
                     val teacher = professionals.find { it.uid == record.teacherId }
                     InteractionCard(record, teacher, onGiftClick = {
-                        teacher?.let { discoveryViewModel.sendGift(it, 10) }
+                        teacher?.let { pointViewModel.giftPoints(it.uid, it.name, 10.0, record.contentId) }
                     })
                 }
             }
@@ -126,7 +139,10 @@ fun ChildManagementScreen(
 
     if (showBuyPoints) {
         BuyPointsDialog(onDismiss = { showBuyPoints = false }, onConfirm = { amount, phone ->
-            discoveryViewModel.buyPoints(amount, phone)
+            val user = FirebaseAuth.getInstance().currentUser
+            val names = (user?.displayName ?: "Parent").trim().split(" ", limit = 2)
+            pointViewModel.buyPoints(amount, user?.email.orEmpty(), phone, names.firstOrNull().orEmpty(), names.getOrNull(1).orEmpty())
+            showBuyPoints = false
         })
     }
 }

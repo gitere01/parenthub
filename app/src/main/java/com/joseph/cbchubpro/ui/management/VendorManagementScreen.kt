@@ -38,6 +38,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -51,6 +52,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.functions.FirebaseFunctions
 import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.Timestamp
 import com.google.firebase.storage.FirebaseStorage
@@ -71,6 +73,7 @@ import java.util.concurrent.TimeUnit
 class VendorViewModel : ViewModel() {
     private val auth = FirebaseAuth.getInstance()
     private val db = FirebaseFirestore.getInstance()
+    private val functions = FirebaseFunctions.getInstance("us-central1")
     // Use default instance to avoid URL mismatch errors
     private val storage = FirebaseStorage.getInstance()
     
@@ -87,6 +90,9 @@ class VendorViewModel : ViewModel() {
 
     private val _allOrders = MutableStateFlow<List<Order>>(emptyList())
     val allOrders = _allOrders.asStateFlow()
+
+    private val _payoutRequests = MutableStateFlow<List<VendorPayoutRequest>>(emptyList())
+    val payoutRequests = _payoutRequests.asStateFlow()
 
     private val _disputedOrders = MutableStateFlow<List<Order>>(emptyList())
     val disputedOrders = _disputedOrders.asStateFlow()
@@ -108,6 +114,9 @@ class VendorViewModel : ViewModel() {
 
     private val _statusMessage = MutableStateFlow<String?>(null)
     val statusMessage = _statusMessage.asStateFlow()
+    private val _boostCheckoutUrl = MutableStateFlow<String?>(null)
+    val boostCheckoutUrl = _boostCheckoutUrl.asStateFlow()
+    fun clearBoostCheckoutUrl() { _boostCheckoutUrl.value = null }
 
     private val _trackingInfo = MutableStateFlow<Map<String, String>>(emptyMap())
     val trackingInfo = _trackingInfo.asStateFlow()
@@ -160,6 +169,12 @@ class VendorViewModel : ViewModel() {
                 
                 orders.filter { it.deliveryMethod == DeliveryMethod.PICKUP_MTAANI_COD && it.status != OrderStatus.COMPLETED && it.status != OrderStatus.CANCELLED }
                     .forEach { fetchLiveTracking(it.id) }
+            }
+
+        db.collection("payout_requests").whereEqualTo("vendorId", uid)
+            .addSnapshotListener { snapshot, _ ->
+                _payoutRequests.value = snapshot?.documents?.mapNotNull { it.toObject(VendorPayoutRequest::class.java)?.copy(id = it.id) }
+                    ?.sortedByDescending { it.createdAt } ?: emptyList()
             }
 
         receivedSwapListener?.remove()
@@ -258,8 +273,18 @@ class VendorViewModel : ViewModel() {
     }
 
     fun updateDealStatus(dealId: String, newStatus: DealStatus) {
+        val uid = auth.currentUser?.uid ?: return
         viewModelScope.launch {
-            db.collection("group_deals").document(dealId).update("status", newStatus).await()
+            try {
+                val ref = db.collection("group_deals").document(dealId)
+                val deal = ref.get().await().toObject(GroupDeal::class.java) ?: throw IllegalStateException("Group deal not found.")
+                if (deal.vendorId != uid) throw IllegalStateException("Only the seller can update this deal.")
+                if (newStatus == DealStatus.SHIPPED && (deal.status != DealStatus.LOCKED || deal.currentJoined < deal.minRequired || deal.buyerDetails.values.any { !it.isPaid })) {
+                    throw IllegalStateException("Wait until the group target is reached and every participant checks out.")
+                }
+                ref.update("status", newStatus.name).await()
+                _statusMessage.value = "Group deal updated to ${newStatus.name.lowercase().replaceFirstChar { it.uppercase() }}."
+            } catch (e: Exception) { _statusMessage.value = e.message ?: "Could not update group deal." }
         }
     }
 
@@ -418,6 +443,14 @@ class VendorViewModel : ViewModel() {
 
     fun createGroupDeal(product: ProductItem, minRequired: Int, deadlineHours: Int) {
         val uid = auth.currentUser?.uid ?: return
+        if (product.listingType != ListingType.GROUP_DEAL || product.groupPrice <= 0.0 || product.groupPrice >= product.price || minRequired < 2 || deadlineHours < 1) {
+            _statusMessage.value = "Set a group price below the original price, a target of at least 2 buyers, and a valid duration."
+            return
+        }
+        if (product.stockQuantity >= 0 && product.stockQuantity < minRequired) {
+            _statusMessage.value = "Stock must cover the minimum group size. Update the listing stock first."
+            return
+        }
         val deal = GroupDeal(
             productId = product.id,
             productName = product.name,
@@ -431,9 +464,18 @@ class VendorViewModel : ViewModel() {
         )
         viewModelScope.launch {
             try {
-                db.collection("group_deals").add(deal).await()
-                db.collection("users").document(uid).collection("products").document(product.id)
-                    .update("isGroupDeal", true, "listingType", ListingType.GROUP_DEAL.name).await()
+                val existingDeals = db.collection("group_deals").whereEqualTo("productId", product.id).get().await()
+                val hasLiveDeal = existingDeals.documents.any { doc ->
+                    val status = doc.getString("status")
+                    status == DealStatus.ACTIVE.name || status == DealStatus.LOCKED.name
+                }
+                if (hasLiveDeal) throw IllegalStateException("This item already has an active group deal.")
+                val productRef = db.collection("users").document(uid).collection("products").document(product.id)
+                val dealRef = db.collection("group_deals").document()
+                db.runBatch { batch ->
+                    batch.set(dealRef, deal)
+                    batch.update(productRef, mapOf("isGroupDeal" to true, "listingType" to ListingType.GROUP_DEAL.name))
+                }.await()
                 _statusMessage.value = "Group Buying Deal Launched!"
             } catch (e: Exception) {
                 _statusMessage.value = "Error launching deal: ${e.message}"
@@ -501,16 +543,71 @@ class VendorViewModel : ViewModel() {
         }
     }
 
-    fun updateAdSettings(productId: String, level: AdLevel) {
+    fun updateProductStatus(productId: String, status: String) {
         val uid = auth.currentUser?.uid ?: return
         viewModelScope.launch {
             try {
-                val updates = mapOf(
-                    "adLevel" to level,
-                    "adStatus" to if (level == AdLevel.FREE) AdStatus.INACTIVE else AdStatus.REQUESTED
-                )
-                db.collection("users").document(uid).collection("products").document(productId).update(updates).await()
-                _statusMessage.value = "Advertisement settings updated."
+                db.collection("users").document(uid).collection("products").document(productId).update("status", status).await()
+                _statusMessage.value = if (status == "Available") "Listing is live in the marketplace." else "Listing marked $status."
+            } catch (e: Exception) { _statusMessage.value = "Could not update listing: ${e.message ?: "Please try again."}" }
+        }
+    }
+
+    fun requestPayout() {
+        val uid = auth.currentUser?.uid ?: return
+        viewModelScope.launch {
+            try {
+                val profile = db.collection("users").document(uid).get().await()
+                val phone = profile.getString("contact") ?: auth.currentUser?.phoneNumber.orEmpty()
+                if (phone.isBlank()) throw IllegalStateException("Add a payout phone number to your seller profile first.")
+                val completedOrders = db.collection("orders").whereEqualTo("vendorId", uid).get().await()
+                    .documents.mapNotNull { it.toObject(Order::class.java) }.filter { it.status == OrderStatus.COMPLETED }
+                val earned = completedOrders.sumOf {
+                    val platformFee = if (it.deliveryMethod == DeliveryMethod.PICKUP_MTAANI_COD) it.platformRevenue else it.totalAmount * 0.02
+                    (it.totalAmount - it.deliveryFee - platformFee).coerceAtLeast(0.0)
+                }
+                val requests = db.collection("payout_requests").whereEqualTo("vendorId", uid).get().await()
+                    .documents.mapNotNull { it.toObject(VendorPayoutRequest::class.java) }
+                val reserved = requests.filter { it.status != "REJECTED" }.sumOf { it.amount }
+                val available = (earned - reserved).coerceAtLeast(0.0)
+                if (available <= 0.0) throw IllegalStateException("There is no completed-order balance available to withdraw yet.")
+                db.collection("payout_requests").add(VendorPayoutRequest(
+                    vendorId = uid,
+                    vendorName = _vendorName.value.ifBlank { profile.getString("name") ?: "Vendor" },
+                    amount = available,
+                    phone = phone,
+                    status = "PENDING"
+                )).await()
+                _statusMessage.value = "Payout request for KES $available sent for admin processing."
+            } catch (e: Exception) { _statusMessage.value = e.message ?: "Could not request payout." }
+        }
+    }
+
+    fun updateAdSettings(productId: String, level: AdLevel, durationDays: Int = 7) {
+        val uid = auth.currentUser?.uid ?: return
+        viewModelScope.launch {
+            try {
+                val productRef = db.collection("users").document(uid).collection("products").document(productId)
+                if (level == AdLevel.FREE) {
+                    val product = productRef.get().await()
+                    val updates = mutableMapOf<String, Any>("adLevel" to level.name, "adStatus" to AdStatus.INACTIVE.name)
+                    val requestId = product.getString("promotionRequestId")
+                    db.runBatch { batch ->
+                        batch.update(productRef, updates)
+                        if (!requestId.isNullOrBlank()) batch.update(db.collection("payment_requests").document(requestId), "status", "CANCELLED")
+                    }.await()
+                    _statusMessage.value = "Promotion removed."
+                } else {
+                    val checkout = functions.getHttpsCallable("createBoostCheckout").call(mapOf(
+                        "productId" to productId,
+                        "adLevel" to level.name,
+                        "durationDays" to durationDays
+                    )).await()
+                    val response = checkout.data as? Map<*, *> ?: throw IllegalStateException("Payment service returned an invalid response.")
+                    _boostCheckoutUrl.value = response["redirectUrl"] as? String
+                        ?: throw IllegalStateException("Payment service did not return a checkout link.")
+                    _statusMessage.value = "Complete the PesaPal checkout. The boost activates after payment confirmation."
+                }
             } catch (e: Exception) {
                 _statusMessage.value = "Error: ${e.message}"
             }
@@ -582,10 +679,21 @@ fun VendorManagementScreen(onLogoutClicked: () -> Unit, viewModel: VendorViewMod
     val deals by viewModel.activeDeals.collectAsState()
     val orders by viewModel.allOrders.collectAsState()
     val disputes by viewModel.disputedOrders.collectAsState()
+    val payoutRequests by viewModel.payoutRequests.collectAsState()
     val swaps by viewModel.swapRequests.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
+    val boostCheckoutUrl by viewModel.boostCheckoutUrl.collectAsState()
     val isUploading by viewModel.isUploading.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
+    val uriHandler = LocalUriHandler.current
+
+    LaunchedEffect(boostCheckoutUrl) {
+        boostCheckoutUrl?.let { url ->
+            runCatching { uriHandler.openUri(url) }
+                .onFailure { snackbarHostState.showSnackbar("Could not open PesaPal checkout: ${it.message}") }
+            viewModel.clearBoostCheckoutUrl()
+        }
+    }
 
     LaunchedEffect(statusMessage) {
         statusMessage?.let {
@@ -639,7 +747,7 @@ fun VendorManagementScreen(onLogoutClicked: () -> Unit, viewModel: VendorViewMod
                     0 -> VendorInventoryTab(items, viewModel, isUploading)
                     1 -> OrdersTab(orders, trackingInfo, viewModel)
                     2 -> LiveDealsTab(deals, viewModel)
-                    3 -> FinanceTab(deals, disputes, viewModel)
+                    3 -> FinanceTab(orders, disputes, payoutRequests, viewModel)
                     4 -> DisputesTab(disputes, viewModel)
                 }
             }
@@ -668,7 +776,7 @@ fun ParentInventoryTab(items: List<ProductItem>, viewModel: VendorViewModel, isU
                     isParent = true,
                     onEdit = { editingProduct = item },
                     onDelete = { viewModel.deleteProduct(item.id) },
-                    onAdRequest = { viewModel.updateAdSettings(item.id, it) }
+                    onAdRequest = { level, days -> viewModel.updateAdSettings(item.id, level, days) }
                 )
             }
         }
@@ -709,7 +817,8 @@ fun ProductInventoryCard(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onLaunchDeal: (() -> Unit)? = null,
-    onAdRequest: (AdLevel) -> Unit
+    onAdRequest: (AdLevel, Int) -> Unit,
+    onStatusChange: ((String) -> Unit)? = null
 ) {
     var showMenu by remember { mutableStateOf(false) }
     var showAdDialog by remember { mutableStateOf(false) }
@@ -757,7 +866,7 @@ fun ProductInventoryCard(
                         }
                     }
                     if (item.adLevel != AdLevel.FREE) {
-                        AdStatusBadge(item.adLevel, item.adStatus)
+                        AdStatusBadge(item.adLevel, item.adStatus, item.adExpiresAt)
                     }
                 }
             }
@@ -786,6 +895,13 @@ fun ProductInventoryCard(
                         },
                         leadingIcon = { Icon(Icons.Default.Campaign, null) }
                     )
+                    onStatusChange?.let { updateStatus ->
+                        if (item.status.equals("Available", ignoreCase = true)) {
+                            DropdownMenuItem(text = { Text("Mark as sold") }, onClick = { showMenu = false; updateStatus("Sold") }, leadingIcon = { Icon(Icons.Default.CheckCircle, null) })
+                        } else {
+                            DropdownMenuItem(text = { Text("Republish listing") }, onClick = { showMenu = false; updateStatus("Available") }, leadingIcon = { Icon(Icons.Default.Publish, null) })
+                        }
+                    }
                     DropdownMenuItem(
                         text = { Text("Delete", color = Color.Red) },
                         onClick = {
@@ -813,8 +929,8 @@ fun ProductInventoryCard(
         AdSelectionDialog(
             currentLevel = item.adLevel,
             onDismiss = { showAdDialog = false },
-            onConfirm = { level ->
-                onAdRequest(level)
+            onConfirm = { level, days ->
+                onAdRequest(level, days)
                 showAdDialog = false
             }
         )
@@ -822,8 +938,9 @@ fun ProductInventoryCard(
 }
 
 @Composable
-fun AdStatusBadge(level: AdLevel, status: AdStatus) {
-    val (text, color) = when (status) {
+fun AdStatusBadge(level: AdLevel, status: AdStatus, expiresAt: Timestamp? = null) {
+    val isExpired = status == AdStatus.ACTIVE && expiresAt != null && expiresAt.toDate().time <= System.currentTimeMillis()
+    val (text, color) = if (isExpired) "EXPIRED · RENEW" to Color.Gray else when (status) {
         AdStatus.REQUESTED -> "Ad Requested" to Color.Gray
         AdStatus.WAITING_FOR_TRACTION -> "Queued" to Color(0xFF2196F3)
         AdStatus.ACTIVE -> "LIVE: ${level.name}" to Color(0xFF4CAF50)
@@ -837,16 +954,22 @@ fun AdStatusBadge(level: AdLevel, status: AdStatus) {
 }
 
 @Composable
-fun AdSelectionDialog(currentLevel: AdLevel, onDismiss: () -> Unit, onConfirm: (AdLevel) -> Unit) {
+fun AdSelectionDialog(currentLevel: AdLevel, onDismiss: () -> Unit, onConfirm: (AdLevel, Int) -> Unit) {
+    var durationDays by remember { mutableIntStateOf(7) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Choose Ad Level") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("Ads will be reviewed and activated to reach more parents.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Text("Choose a promotion tier and duration. Pay securely through PesaPal; your boost goes live after payment confirmation.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(7, 30).forEach { days ->
+                        FilterChip(selected = durationDays == days, onClick = { durationDays = days }, label = { Text("$days days") })
+                    }
+                }
                 AdLevel.entries.forEach { level ->
                     Card(
-                        modifier = Modifier.fillMaxWidth().clickable { onConfirm(level) },
+                        modifier = Modifier.fillMaxWidth().clickable { onConfirm(level, durationDays) },
                         colors = CardDefaults.cardColors(containerColor = if(level == currentLevel) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant)
                     ) {
                         Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -854,11 +977,11 @@ fun AdSelectionDialog(currentLevel: AdLevel, onDismiss: () -> Unit, onConfirm: (
                                 Text(level.name, fontWeight = FontWeight.Bold)
                                 val price = when(level) {
                                     AdLevel.FREE -> "Free"
-                                    AdLevel.BASIC -> "KES 50"
-                                    AdLevel.PREMIUM -> "KES 150"
-                                    AdLevel.FEATURED -> "KES 500"
+                                    AdLevel.BASIC -> "KES ${if (durationDays == 30) 150 else 50}"
+                                    AdLevel.PREMIUM -> "KES ${if (durationDays == 30) 450 else 150}"
+                                    AdLevel.FEATURED -> "KES ${if (durationDays == 30) 1500 else 500}"
                                 }
-                                Text(price, style = MaterialTheme.typography.labelSmall)
+                                Text(if (level == AdLevel.FREE) price else "$price · $durationDays days", style = MaterialTheme.typography.labelSmall)
                             }
                             if (level == currentLevel) Icon(Icons.Default.CheckCircle, null, tint = MaterialTheme.colorScheme.primary)
                         }
@@ -1403,6 +1526,14 @@ fun AddItemDialog(
             images = images + uris.take(spaceLeft).map { it as Any }
         }
     }
+
+    val validListingPrice = if (isParent) true else when (listingType) {
+        ListingType.RETAIL, ListingType.SERVICE, ListingType.PROFESSIONAL -> (retailPrice.toDoubleOrNull() ?: 0.0) > 0.0
+        ListingType.WHOLESALE -> (wholesalePrice.toDoubleOrNull() ?: 0.0) > 0.0 && (minWholesaleQty.toDoubleOrNull() ?: 0.0) > 0.0
+        ListingType.GROUP_DEAL -> (groupPrice.toDoubleOrNull() ?: 0.0) > 0.0 && (minGroupQty.toIntOrNull() ?: 0) > 0 &&
+            (retailPrice.toDoubleOrNull() ?: 0.0) > (groupPrice.toDoubleOrNull() ?: 0.0)
+    }
+    val validStock = stockQty.isBlank() || (stockQty.toIntOrNull()?.let { it >= 0 } == true)
     
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1470,6 +1601,14 @@ fun AddItemDialog(
 
                 OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Name") }, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = category, onValueChange = { category = it }, label = { Text("Specific Category") }, modifier = Modifier.fillMaxWidth())
+                if (!isParent) {
+                    Text("Condition (supports resale listings)", style = MaterialTheme.typography.labelMedium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf("New", "Used", "Refurbished").forEach { value ->
+                            FilterChip(selected = condition.equals(value, ignoreCase = true), onClick = { condition = value }, label = { Text(value) })
+                        }
+                    }
+                }
                 
                 if (isParent) {
                     OutlinedTextField(value = condition, onValueChange = { condition = it }, label = { Text("Condition") }, modifier = Modifier.fillMaxWidth())
@@ -1540,12 +1679,13 @@ fun AddItemDialog(
                     listingType = if (isParent) ListingType.RETAIL else listingType,
                     promoLabel = promoLabel,
                     stockQuantity = stockQty.toIntOrNull() ?: -1,
+                    isNew = condition.equals("New", ignoreCase = true),
                     colors = colorsStr.split(",").map { it.trim() }.filter { it.isNotEmpty() },
                     sku = sku,
                     brand = brand
                 )
                 onAdd(product, images)
-            }, enabled = !isUploading && name.isNotEmpty() && images.isNotEmpty()) {
+            }, enabled = !isUploading && name.isNotBlank() && category.isNotBlank() && images.isNotEmpty() && validListingPrice && validStock) {
                 Text(if (isUploading) "Uploading..." else "Save")
             }
         },
@@ -1638,7 +1778,7 @@ fun DisputesTab(disputes: List<Order>, viewModel: VendorViewModel) {
 }
 
 @Composable
-fun FinanceTab(deals: List<GroupDeal>, disputes: List<Order>, viewModel: VendorViewModel) {
+fun FinanceTab(orders: List<Order>, disputes: List<Order>, payoutRequests: List<VendorPayoutRequest>, viewModel: VendorViewModel) {
     Column(modifier = Modifier.padding(16.dp).verticalScroll(rememberScrollState())) {
         Text("Financial Summary", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(16.dp))
@@ -1664,15 +1804,37 @@ fun FinanceTab(deals: List<GroupDeal>, disputes: List<Order>, viewModel: VendorV
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text("Payout Balance", style = MaterialTheme.typography.labelSmall)
-                val total = deals.filter { it.status != DealStatus.CANCELLED }.sumOf { it.totalCollected }
-                Text("KES $total", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
+                val completedEarnings = orders.filter { it.status == OrderStatus.COMPLETED }
+                    .sumOf {
+                        val platformFee = if (it.deliveryMethod == DeliveryMethod.PICKUP_MTAANI_COD) it.platformRevenue else it.totalAmount * 0.02
+                        (it.totalAmount - it.deliveryFee - platformFee).coerceAtLeast(0.0)
+                    }
+                val reservedPayouts = payoutRequests.filter { it.status != "REJECTED" }.sumOf { it.amount }
+                val available = (completedEarnings - reservedPayouts).coerceAtLeast(0.0)
+                Text("KES ${String.format(Locale.getDefault(), "%.2f", available)}", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
+                Text("From completed orders after delivery and platform fees.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                 
                 if (disputes.isNotEmpty()) {
                     Text("Held in Disputes: KES ${disputes.sumOf { it.totalAmount }}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
                 }
 
                 HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
-                Button(onClick = { }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) { Text("Request Payout to M-Pesa") }
+                Button(onClick = { viewModel.requestPayout() }, enabled = available > 0.0, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) { Text("Request payout to M-Pesa") }
+            }
+        }
+        if (payoutRequests.isNotEmpty()) {
+            Spacer(Modifier.height(16.dp))
+            Text("Payout requests", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            payoutRequests.forEach { request ->
+                Card(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                    Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Column {
+                            Text("KES ${request.amount}", fontWeight = FontWeight.Bold)
+                            Text(request.phone, style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                        }
+                        Text(request.status, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium)
+                    }
+                }
             }
         }
     }
@@ -1707,7 +1869,8 @@ fun FinanceTab(deals: List<GroupDeal>, disputes: List<Order>, viewModel: VendorV
                     onEdit = { editingProduct = item },
                     onDelete = { viewModel.deleteProduct(item.id) },
                     onLaunchDeal = { showCreateDealDialog = item },
-                    onAdRequest = { viewModel.updateAdSettings(item.id, it) }
+                    onAdRequest = { level, days -> viewModel.updateAdSettings(item.id, level, days) },
+                    onStatusChange = { viewModel.updateProductStatus(item.id, it) }
                 )
             }
         }
@@ -1818,9 +1981,11 @@ fun FinanceTab(deals: List<GroupDeal>, disputes: List<Order>, viewModel: VendorV
             }
             if (deal.status == DealStatus.LOCKED) {
                 Spacer(Modifier.height(16.dp))
-                Button(onClick = { onUpdateStatus(DealStatus.SHIPPED) }, modifier = Modifier.fillMaxWidth()) {
+                val readyToShip = deal.currentJoined >= deal.minRequired && deal.buyerDetails.isNotEmpty() && deal.buyerDetails.values.all { it.isPaid }
+                Button(onClick = { onUpdateStatus(DealStatus.SHIPPED) }, modifier = Modifier.fillMaxWidth(), enabled = readyToShip) {
                     Icon(Icons.Default.LocalShipping, null); Spacer(Modifier.width(8.dp)); Text("Ready to Ship")
                 }
+                if (!readyToShip) Text("Checkout is still pending for one or more participants.", style = MaterialTheme.typography.labelSmall, color = Color.Gray, modifier = Modifier.padding(top = 4.dp))
             }
         }
     }
@@ -1842,18 +2007,24 @@ fun FinanceTab(deals: List<GroupDeal>, disputes: List<Order>, viewModel: VendorV
 @Composable fun CreateDealDialog(product: ProductItem, onDismiss: () -> Unit, onCreate: (Int, Int) -> Unit) {
     var minRequired by remember { mutableStateOf(product.minGroupQuantity.toString()) }
     var duration by remember { mutableStateOf("24") }
+    val minimumBuyers = minRequired.toIntOrNull() ?: 0
+    val durationHours = duration.toIntOrNull() ?: 0
     AlertDialog(
         onDismissRequest = onDismiss, 
         title = { Text("Launch Group Buying") }, 
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(product.name, fontWeight = FontWeight.Bold)
+                Text("Group price: KES ${product.groupPrice} (usual price KES ${product.price})", style = MaterialTheme.typography.bodySmall)
                 OutlinedTextField(value = minRequired, onValueChange = { minRequired = it }, label = { Text("Min Buyers Required") }, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = duration, onValueChange = { duration = it }, label = { Text("Duration (Hours)") }, modifier = Modifier.fillMaxWidth())
+                if (minimumBuyers < 2 || durationHours < 1 || product.groupPrice <= 0 || product.groupPrice >= product.price) {
+                    Text("Set a valid target, duration, and discounted group price before launching.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
             }
         }, 
         confirmButton = { 
-            Button(onClick = { onCreate(minRequired.toIntOrNull() ?: 5, duration.toIntOrNull() ?: 24) }) { 
+            Button(onClick = { onCreate(minimumBuyers, durationHours) }, enabled = minimumBuyers >= 2 && durationHours >= 1 && product.groupPrice > 0 && product.groupPrice < product.price) {
                 Text("Launch") 
             } 
         }, 

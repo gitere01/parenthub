@@ -44,6 +44,19 @@ data class RevenueSummary(
     val totalRevenue: Double = 0.0
 )
 
+data class ProductPromotionRequest(
+    val id: String = "",
+    val userId: String = "",
+    val productId: String = "",
+    val productName: String = "",
+    val amount: Double = 0.0,
+    val adLevel: String = "",
+    val durationDays: Int = 7,
+    val phone: String = "",
+    val status: String = "PENDING",
+    val timestamp: com.google.firebase.Timestamp? = null
+)
+
 class AdminViewModel : ViewModel() {
     private val db = FirebaseFirestore.getInstance()
     private val auth = FirebaseAuth.getInstance()
@@ -56,6 +69,13 @@ class AdminViewModel : ViewModel() {
 
     private val _pointTransactions = MutableStateFlow<List<PointTransaction>>(emptyList())
     val pointTransactions = _pointTransactions.asStateFlow()
+
+    private val _promotionRequests = MutableStateFlow<List<ProductPromotionRequest>>(emptyList())
+    val promotionRequests = _promotionRequests.asStateFlow()
+    private val _payoutRequests = MutableStateFlow<List<VendorPayoutRequest>>(emptyList())
+    val payoutRequests = _payoutRequests.asStateFlow()
+    private val _teacherRedemptions = MutableStateFlow<List<RedemptionRequest>>(emptyList())
+    val teacherRedemptions = _teacherRedemptions.asStateFlow()
 
     private val _platformSettings = MutableStateFlow(PlatformSettings())
     val platformSettings = _platformSettings.asStateFlow()
@@ -97,6 +117,9 @@ class AdminViewModel : ViewModel() {
         fetchAllOrders()
         fetchPlatformSettings()
         fetchPointTransactions()
+        fetchPromotionRequests()
+        fetchPayoutRequests()
+        fetchTeacherRedemptions()
     }
 
     private fun fetchUsers() {
@@ -138,6 +161,62 @@ class AdminViewModel : ViewModel() {
                     try { doc.toObject(PointTransaction::class.java)?.copy(id = doc.id) } catch (_: Exception) { null }
                 } ?: emptyList()
             }
+    }
+
+    private fun fetchPromotionRequests() {
+        db.collection("payment_requests").whereEqualTo("type", "PRODUCT_AD_BOOST")
+            .addSnapshotListener { snapshot, _ ->
+                _promotionRequests.value = snapshot?.documents?.mapNotNull { doc ->
+                    doc.toObject(ProductPromotionRequest::class.java)?.copy(id = doc.id)
+                }?.filter { it.status == "PENDING" }?.sortedByDescending { it.timestamp } ?: emptyList()
+            }
+    }
+
+    private fun fetchPayoutRequests() {
+        db.collection("payout_requests").addSnapshotListener { snapshot, _ ->
+            _payoutRequests.value = snapshot?.documents?.mapNotNull { doc ->
+                doc.toObject(VendorPayoutRequest::class.java)?.copy(id = doc.id)
+            }?.filter { it.status == "PENDING" || it.status == "APPROVED" }
+                ?.sortedByDescending { it.createdAt } ?: emptyList()
+        }
+    }
+
+    private fun fetchTeacherRedemptions() {
+        db.collection("redemption_requests").whereEqualTo("status", "PENDING")
+            .addSnapshotListener { snapshot, _ ->
+                _teacherRedemptions.value = snapshot?.documents?.mapNotNull { doc ->
+                    doc.toObject(RedemptionRequest::class.java)?.copy(id = doc.id)
+                }?.sortedBy { it.createdAt } ?: emptyList()
+            }
+    }
+
+    fun reviewTeacherRedemption(request: RedemptionRequest, paid: Boolean) {
+        viewModelScope.launch {
+            try {
+                db.runTransaction { transaction ->
+                    val requestRef = db.collection("redemption_requests").document(request.id)
+                    val current = transaction.get(requestRef)
+                    if (!current.exists() || current.getString("status") != "PENDING") return@runTransaction
+                    if (paid) {
+                        transaction.update(requestRef, mapOf("status" to "PAID", "paidAt" to com.google.firebase.Timestamp.now()))
+                    } else {
+                        val balanceRef = db.collection("point_balances").document(request.teacherId)
+                        transaction.update(balanceRef, "totalPoints", com.google.firebase.firestore.FieldValue.increment(request.pointsToRedeem))
+                        transaction.update(requestRef, mapOf("status" to "REJECTED", "reviewedAt" to com.google.firebase.Timestamp.now()))
+                    }
+                }.await()
+                _statusMessage.value = if (paid) "Teacher cashout marked paid." else "Cashout rejected; points returned to the teacher."
+            } catch (e: Exception) { _statusMessage.value = "Could not review teacher cashout: ${e.message ?: "Please try again."}" }
+        }
+    }
+
+    fun updatePayoutStatus(requestId: String, status: String) {
+        viewModelScope.launch {
+            try {
+                db.collection("payout_requests").document(requestId).update("status", status).await()
+                _statusMessage.value = if (status == "PAID") "Payout marked paid." else "Payout request marked $status."
+            } catch (e: Exception) { _statusMessage.value = "Could not update payout: ${e.message ?: "Please try again."}" }
+        }
     }
 
     fun updatePlatformSettings(settings: PlatformSettings) {
@@ -210,13 +289,16 @@ class AdminViewModel : ViewModel() {
 @Composable
 fun AdminManagementScreen(onLogoutClicked: () -> Unit, viewModel: AdminViewModel = viewModel()) {
     var selectedTab by remember { mutableIntStateOf(0) }
-    val tabs = listOf("Revenue", "Point Sales", "Verification", "Orders", "Users", "Settings")
+    val tabs = listOf("Revenue", "Point Sales", "Verification", "Orders", "Users", "Promotions", "Payouts", "Teacher Cashouts", "Settings")
 
     val users by viewModel.users.collectAsState()
     val revenue by viewModel.revenue.collectAsState()
     val settings by viewModel.platformSettings.collectAsState()
     val allOrders by viewModel.allOrders.collectAsState()
     val pointTransactions by viewModel.pointTransactions.collectAsState()
+    val promotionRequests by viewModel.promotionRequests.collectAsState()
+    val payoutRequests by viewModel.payoutRequests.collectAsState()
+    val teacherRedemptions by viewModel.teacherRedemptions.collectAsState()
     val status by viewModel.statusMessage.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -257,7 +339,10 @@ fun AdminManagementScreen(onLogoutClicked: () -> Unit, viewModel: AdminViewModel
                 2 -> AdminVerificationTab(users.filter { it.verificationPending }, viewModel)
                 3 -> AdminOrdersTab(allOrders, viewModel)
                 4 -> AdminUsersTab(users, viewModel)
-                5 -> AdminPlatformSettingsTab(settings, viewModel)
+                5 -> AdminPromotionsTab(promotionRequests, viewModel)
+                6 -> AdminPayoutsTab(payoutRequests, viewModel)
+                7 -> AdminTeacherCashoutsTab(teacherRedemptions, viewModel)
+                8 -> AdminPlatformSettingsTab(settings, viewModel)
             }
         }
     }
@@ -354,6 +439,81 @@ fun AdminVerificationTab(pendingUsers: List<AppUser>, viewModel: AdminViewModel)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = { viewModel.verifyUser(user.id, true) }, Modifier.weight(1f)) { Text("Approve") }
                             OutlinedButton(onClick = { viewModel.verifyUser(user.id, false) }, Modifier.weight(1f), colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Red)) { Text("Reject") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AdminPromotionsTab(requests: List<ProductPromotionRequest>, viewModel: AdminViewModel) {
+    if (requests.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No boost payments awaiting confirmation") }
+    } else {
+        LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item {
+                Text("Boosts activate automatically after PesaPal confirms payment. This list is for payment monitoring.", style = MaterialTheme.typography.bodySmall)
+            }
+            items(requests, key = { it.id }) { request ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("${request.adLevel.replace("_", " ")} promotion · ${request.durationDays} days", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                        Text("Vendor: ${viewModel.getUserName(request.userId)}")
+                        Text("Product: ${request.productName.ifBlank { request.productId }}")
+                        Text("Amount: ${viewModel.formatCurrency(request.amount)}")
+                        Text("Status: Awaiting PesaPal confirmation", color = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AdminPayoutsTab(requests: List<VendorPayoutRequest>, viewModel: AdminViewModel) {
+    if (requests.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No pending seller payouts") }
+    } else {
+        LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            items(requests, key = { it.id }) { request ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(request.vendorName, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                        Text("KES ${request.amount} to ${request.phone}")
+                        Text("Status: ${request.status}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                            if (request.status == "PENDING") {
+                                OutlinedButton(onClick = { viewModel.updatePayoutStatus(request.id, "REJECTED") }, modifier = Modifier.weight(1f)) { Text("Reject") }
+                                Button(onClick = { viewModel.updatePayoutStatus(request.id, "APPROVED") }, modifier = Modifier.weight(1f)) { Text("Approve") }
+                            } else {
+                                Button(onClick = { viewModel.updatePayoutStatus(request.id, "PAID") }, modifier = Modifier.fillMaxWidth()) { Text("Mark paid after transfer") }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AdminTeacherCashoutsTab(requests: List<RedemptionRequest>, viewModel: AdminViewModel) {
+    if (requests.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No teacher cashouts awaiting review") }
+    } else {
+        LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item { Text("Send the cashout to the teacher’s M-Pesa number, then mark it paid.", style = MaterialTheme.typography.bodySmall) }
+            items(requests, key = { it.id }) { request ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(request.teacherName, fontWeight = FontWeight.Bold)
+                        Text("KES ${"%.2f".format(request.amountInCash)} · ${request.pointsToRedeem} points")
+                        Text("M-Pesa: ${request.paymentDetails}")
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { viewModel.reviewTeacherRedemption(request, paid = false) }, modifier = Modifier.weight(1f)) { Text("Reject & return points") }
+                            Button(onClick = { viewModel.reviewTeacherRedemption(request, paid = true) }, modifier = Modifier.weight(1f)) { Text("Mark paid") }
                         }
                     }
                 }

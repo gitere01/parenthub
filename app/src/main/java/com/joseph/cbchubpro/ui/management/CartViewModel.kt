@@ -45,6 +45,28 @@ class CartViewModel : ViewModel() {
     private val _pickupPoints = MutableStateFlow<List<PickupPoint>>(emptyList())
     val pickupPoints = _pickupPoints.asStateFlow()
 
+    private val _sellerContacts = MutableStateFlow<Map<String, Pair<String, String>>>(emptyMap())
+    val sellerContacts = _sellerContacts.asStateFlow()
+
+    fun loadSellerContacts(vendorIds: List<String>) {
+        val missing = vendorIds.filter { it.isNotBlank() && !_sellerContacts.value.containsKey(it) }
+        if (missing.isEmpty()) return
+        viewModelScope.launch {
+            val contacts = _sellerContacts.value.toMutableMap()
+            missing.forEach { vendorId ->
+                runCatching {
+                    val profile = db.collection("users").document(vendorId).get().await()
+                    val phone = profile.getString("contact")
+                        ?: profile.getString("phone")
+                        ?: profile.getString("phoneNumber")
+                        ?: ""
+                    contacts[vendorId] = (profile.getString("name") ?: "Seller") to phone
+                }.onFailure { contacts[vendorId] = "Seller" to "" }
+            }
+            _sellerContacts.value = contacts
+        }
+    }
+
     init {
         fetchPlatformConfig()
     }
@@ -108,43 +130,89 @@ class CartViewModel : ViewModel() {
         viewModelScope.launch {
             _isProcessing.value = true
             try {
-                val orderId = "PM-" + UUID.randomUUID().toString().take(8).uppercase()
                 val currentCart = _cartItems.value
-                val subtotal = currentCart.sumOf { it.price * it.quantity }
-                
-                // Use API fee + 50 bob revenue
-                val deliveryFee = selectedPoint.baseFee + FinanceConstants.PLATFORM_HUB_REVENUE
-                val total = subtotal + deliveryFee
-                
-                val order = Order(
-                    id = orderId,
-                    buyerId = currentUser.uid,
-                    buyerName = currentUser.displayName ?: "User",
-                    vendorId = currentCart.firstOrNull()?.vendorId ?: "",
-                    vendorName = currentCart.firstOrNull()?.productName?.substringBefore(" ") ?: "Vendor", 
-                    items = currentCart,
-                    subtotal = subtotal,
-                    deliveryFee = deliveryFee,
-                    platformRevenue = FinanceConstants.PLATFORM_HUB_REVENUE,
-                    totalAmount = total,
-                    pickupPoint = selectedPoint.name,
-                    phoneNumber = phoneNumber,
-                    deliveryMethod = DeliveryMethod.PICKUP_MTAANI_COD,
-                    status = OrderStatus.AWAITING_COD
-                )
+                if (currentCart.isEmpty()) throw IllegalStateException("Your cart is empty.")
+                if (currentCart.any { it.vendorId.isBlank() }) throw IllegalStateException("One item has no seller attached. Remove it and add it again.")
 
-                // Update Group Deals if applicable
-                currentCart.forEach { item ->
-                    if (item.dealId.isNotEmpty()) {
-                        updateGroupDealBuyerInfo(item.dealId, currentUser.uid, phoneNumber, selectedPoint.name, DeliveryMethod.PICKUP_MTAANI_COD)
-                    }
+                val itemsByVendor = currentCart.groupBy { it.vendorId }
+                val vendorNames = itemsByVendor.keys.associateWith { vendorId ->
+                    db.collection("users").document(vendorId).get().await().getString("name") ?: "Vendor"
+                }
+                val orders = itemsByVendor.map { (vendorId, vendorItems) ->
+                    val orderId = "PM-" + UUID.randomUUID().toString().take(8).uppercase()
+                    val subtotal = vendorItems.sumOf { it.price * it.quantity }
+                    val deliveryFee = selectedPoint.baseFee + FinanceConstants.PLATFORM_HUB_REVENUE
+                    Order(
+                        id = orderId,
+                        buyerId = currentUser.uid,
+                        buyerName = currentUser.displayName ?: "User",
+                        vendorId = vendorId,
+                        vendorName = vendorNames[vendorId] ?: "Vendor",
+                        items = vendorItems,
+                        subtotal = subtotal,
+                        deliveryFee = deliveryFee,
+                        platformRevenue = FinanceConstants.PLATFORM_HUB_REVENUE,
+                        totalAmount = subtotal + deliveryFee,
+                        pickupPoint = selectedPoint.name,
+                        phoneNumber = phoneNumber,
+                        deliveryMethod = DeliveryMethod.PICKUP_MTAANI_COD,
+                        status = OrderStatus.AWAITING_COD
+                    )
                 }
 
-                registerWithPickupMtaani(orderId, total, selectedPoint.name)
+                db.runTransaction { transaction ->
+                    val inventoryItems = currentCart.groupBy { it.vendorId to it.productId }
+                    val inventoryRefs = inventoryItems.map { (key, items) ->
+                        Triple(key, items, db.collection("users").document(key.first).collection("products").document(key.second))
+                    }
+                    val inventorySnapshots = inventoryRefs.map { (_, _, ref) -> transaction.get(ref) }
+                    val dealIds = currentCart.mapNotNull { it.dealId.takeIf(String::isNotBlank) }.distinct()
+                    val dealRefs = dealIds.associateWith { db.collection("group_deals").document(it) }
+                    val dealSnapshots = dealRefs.mapValues { (_, ref) -> transaction.get(ref) }
 
-                db.collection("orders").document(orderId).set(order).await()
+                    inventoryRefs.forEachIndexed { index, (_, items, ref) ->
+                        val snapshot = inventorySnapshots[index]
+                        val productName = items.first().productName
+                        if (!snapshot.exists()) throw IllegalStateException("$productName is no longer available.")
+                        val status = snapshot.getString("status") ?: "Available"
+                        if (!status.equals("Available", ignoreCase = true)) throw IllegalStateException("$productName is no longer available.")
+                        val stock = snapshot.getLong("stockQuantity")?.toInt() ?: -1
+                        if (stock >= 0) {
+                            val requested = items.sumOf { kotlin.math.ceil(it.quantity).toInt() }
+                            if (stock < requested) throw IllegalStateException("Not enough stock for $productName.")
+                            transaction.update(ref, "stockQuantity", stock - requested)
+                            if (stock == requested) transaction.update(ref, "status", "Sold")
+                        }
+                    }
 
-                _checkoutStatus.value = "✅ Order Placed! Total KES $total (Includes KES $deliveryFee delivery). Pay at ${selectedPoint.name} agent."
+                    dealSnapshots.forEach { (dealId, snapshot) ->
+                        val deal = snapshot.toObject(GroupDeal::class.java)
+                            ?: throw IllegalStateException("A group offer has expired.")
+                        if (deal.status != DealStatus.LOCKED && deal.status != DealStatus.ACTIVE) {
+                            throw IllegalStateException("A group offer is no longer available.")
+                        }
+                        val buyer = deal.buyerDetails[currentUser.uid]
+                            ?: throw IllegalStateException("Join the group offer before checkout.")
+                        val updatedBuyers = deal.buyerDetails.toMutableMap()
+                        updatedBuyers[currentUser.uid] = buyer.copy(
+                            phoneNumber = phoneNumber,
+                            deliveryMethod = DeliveryMethod.PICKUP_MTAANI_COD,
+                            pickupPoint = selectedPoint.name,
+                            shippingAddress = "",
+                            isPaid = true
+                        )
+                        transaction.update(dealRefs.getValue(dealId), mapOf(
+                            "buyerDetails" to updatedBuyers,
+                            "totalCollected" to deal.totalCollected + if (buyer.isPaid) 0.0 else deal.pricePerPerson
+                        ))
+                    }
+                    orders.forEach { order -> transaction.set(db.collection("orders").document(order.id), order) }
+                    null
+                }.await()
+
+                orders.forEach { order -> registerWithPickupMtaani(order.id, order.totalAmount, selectedPoint.name) }
+                val total = orders.sumOf { it.totalAmount }
+                _checkoutStatus.value = "✅ ${orders.size} seller order${if (orders.size == 1) "" else "s"} placed. Total KES $total; pay at ${selectedPoint.name}."
                 clearCart()
                 onSuccess()
             } catch (e: Exception) {

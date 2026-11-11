@@ -1,6 +1,7 @@
 package com.joseph.cbchubpro.ui.discovery
 
 import android.net.Uri
+import android.content.Intent
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -135,20 +136,24 @@ fun MarketplaceScreen(
                 4 -> professionalVendors
                 else -> emptyList()
             }
+            val liveDealProductIds = activeGroupDeals.map { it.productId }.toSet()
+            val visibleVendors = if (selectedTab == 1) currentVendors.mapNotNull { vendor ->
+                vendor.copy(products = vendor.products.filter { it.id in liveDealProductIds }).takeIf { it.products.isNotEmpty() }
+            } else currentVendors
 
             LazyColumn(
                 modifier = Modifier.fillMaxSize().padding(padding),
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(24.dp)
             ) {
-                if (currentVendors.isEmpty()) {
+                if (visibleVendors.isEmpty()) {
                     item {
                         Box(modifier = Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) {
                             Text("No items found in this category", color = Color.Gray)
                         }
                     }
                 }
-                items(currentVendors) { entry ->
+                items(visibleVendors) { entry ->
                     VendorSection(entry, onVendorClicked, isSwapHub = false, activeGroupDeals = activeGroupDeals, cartViewModel = cartViewModel, discoveryViewModel = viewModel)
                 }
             }
@@ -164,8 +169,16 @@ fun PropertyDiscoveryScreen(
 ) {
     val properties by viewModel.properties.collectAsState()
     val searchQuery by viewModel.searchQuery.collectAsState()
+    val statusMessage by viewModel.statusMessage.collectAsState()
+    var selectedType by remember { mutableStateOf("ALL") }
+    var inquiryProperty by remember { mutableStateOf<PropertyListing?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    LaunchedEffect(statusMessage) {
+        statusMessage?.let { snackbarHostState.showSnackbar(it); viewModel.clearStatus() }
+    }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             Column {
                 TopAppBar(
@@ -184,6 +197,11 @@ fun PropertyDiscoveryScreen(
                     shape = RoundedCornerShape(12.dp),
                     leadingIcon = { Icon(Icons.Default.Search, null) }
                 )
+                ScrollableTabRow(selectedTabIndex = listOf("ALL", "SALE", "RENT", "LEASE").indexOf(selectedType), edgePadding = 16.dp) {
+                    listOf("ALL", "SALE", "RENT", "LEASE").forEach { type ->
+                        Tab(selected = selectedType == type, onClick = { selectedType = type }, text = { Text(if (type == "ALL") "All listings" else type.lowercase().replaceFirstChar { it.uppercase() }) })
+                    }
+                }
             }
         }
     ) { padding ->
@@ -194,20 +212,27 @@ fun PropertyDiscoveryScreen(
         ) {
             val filtered = properties.filter { 
                 (it.propertyCategory != "Hotel Room" && it.propertyCategory != "Room") &&
+                (selectedType == "ALL" || it.type.equals(selectedType, ignoreCase = true)) &&
                 (searchQuery.isEmpty() || it.title.contains(searchQuery, true) || it.location.contains(searchQuery, true))
             }
             if (filtered.isEmpty()) {
                 item { Box(modifier = Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) { Text("No properties found", color = Color.Gray) } }
             }
             items(filtered) { property ->
-                PropertyCard(property)
+                PropertyCard(property) { inquiryProperty = property }
             }
+        }
+    }
+    inquiryProperty?.let { property ->
+        PropertyInquiryDialog(property, onDismiss = { inquiryProperty = null }) { contact, message ->
+            viewModel.sendPropertyInquiry(property, contact, message)
+            inquiryProperty = null
         }
     }
 }
 
 @Composable
-fun PropertyCard(property: PropertyListing) {
+fun PropertyCard(property: PropertyListing, onContact: () -> Unit) {
     var showDialog by remember { mutableStateOf(false) }
     Card(
         modifier = Modifier.fillMaxWidth().clickable { showDialog = true },
@@ -233,7 +258,7 @@ fun PropertyCard(property: PropertyListing) {
                     shape = RoundedCornerShape(8.dp)
                 ) {
                     Text(
-                        "KES ${property.price}${if(property.type == "RENT") "/mo" else ""}",
+                        "KES ${property.price}${if(property.type == "RENT" || property.type == "LEASE") "/mo" else ""}",
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
                         color = Color.White,
                         fontWeight = FontWeight.Bold
@@ -242,6 +267,7 @@ fun PropertyCard(property: PropertyListing) {
             }
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(property.title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                SuggestionChip(onClick = {}, label = { Text(property.type.lowercase().replaceFirstChar { it.uppercase() }) })
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.LocationOn, null, modifier = Modifier.size(16.dp), tint = Color.Gray)
                     Text(property.location, style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
@@ -257,7 +283,7 @@ fun PropertyCard(property: PropertyListing) {
     }
 
     if (showDialog) {
-        PropertyDetailDialog(property, onDismiss = { showDialog = false })
+        PropertyDetailDialog(property, onDismiss = { showDialog = false }, onContact = { showDialog = false; onContact() })
     }
 }
 
@@ -272,7 +298,7 @@ fun PropertyStat(icon: androidx.compose.ui.graphics.vector.ImageVector, text: St
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PropertyDetailDialog(property: PropertyListing, onDismiss: () -> Unit) {
+fun PropertyDetailDialog(property: PropertyListing, onDismiss: () -> Unit, onContact: () -> Unit = {}) {
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(modifier = Modifier.fillMaxSize()) {
             Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
@@ -286,7 +312,10 @@ fun PropertyDetailDialog(property: PropertyListing, onDismiss: () -> Unit) {
                 }
                 Column(modifier = Modifier.padding(24.dp)) {
                     Text(property.title, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-                    Text("KES ${property.price}", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.ExtraBold)
+                    Text("KES ${property.price}${if (property.type == "RENT" || property.type == "LEASE") "/ month" else ""}", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.ExtraBold)
+                    Text("${property.type} · ${property.propertyCategory} · ${property.location}", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+                    if (property.deposit > 0) Text("Deposit: KES ${property.deposit}", style = MaterialTheme.typography.bodyMedium)
+                    if (property.address.isNotBlank()) Text("Address: ${property.address}", style = MaterialTheme.typography.bodyMedium)
                     
                     Spacer(Modifier.height(16.dp))
                     Text("Amenities", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
@@ -301,13 +330,32 @@ fun PropertyDetailDialog(property: PropertyListing, onDismiss: () -> Unit) {
                     Text(property.description)
                     
                     Spacer(Modifier.height(24.dp))
-                    Button(onClick = { /* Contact Agent */ }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
-                        Text("Book / Contact Agent")
+                    Button(onClick = onContact, modifier = Modifier.fillMaxWidth().height(56.dp)) {
+                        Text(if (property.type == "SALE") "Enquire about this property" else "Request a viewing")
                     }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun PropertyInquiryDialog(property: PropertyListing, onDismiss: () -> Unit, onSubmit: (String, String) -> Unit) {
+    var contact by remember { mutableStateOf(FirebaseAuth.getInstance().currentUser?.phoneNumber.orEmpty()) }
+    var message by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (property.type == "SALE") "Enquire about property" else "Request a viewing") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Your enquiry will go to ${property.agentName.ifBlank { "the listing agent" }}.", style = MaterialTheme.typography.bodySmall)
+                OutlinedTextField(contact, { contact = it }, label = { Text("Your phone number") }, singleLine = true)
+                OutlinedTextField(message, { message = it }, label = { Text("Message (optional)") }, minLines = 2)
+            }
+        },
+        confirmButton = { Button(onClick = { onSubmit(contact.trim(), message.trim()) }, enabled = contact.isNotBlank()) { Text("Send enquiry") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -653,13 +701,18 @@ fun ProductCard(product: ProductItem, isSwapHub: Boolean, activeGroupDeals: List
                             Text(product.promoLabel.uppercase(), fontSize = 8.sp, fontWeight = FontWeight.ExtraBold)
                         }
                     }
-                    if (product.isNew) {
-                        Badge(containerColor = Color(0xFFFF9800)) { Text("NEW", fontSize = 8.sp, color = Color.White) }
+                    if (!isSwapHub && product.condition.isNotBlank()) {
+                        Badge(containerColor = if (product.condition.equals("New", ignoreCase = true)) Color(0xFFFF9800) else MaterialTheme.colorScheme.tertiary) {
+                            Text(product.condition.uppercase(), fontSize = 8.sp, color = Color.White)
+                        }
+                    }
+                    if (product.adStatus == AdStatus.ACTIVE && product.adLevel != AdLevel.FREE && (product.adExpiresAt == null || product.adExpiresAt.toDate().time > System.currentTimeMillis())) {
+                        Badge(containerColor = Color(0xFFFFC107)) { Text("PROMOTED", fontSize = 8.sp, color = Color.Black) }
                     }
                     if (product.verificationStatus == VerificationStatus.VERIFIED) {
                         Badge(containerColor = Color(0xFF2196F3)) { Text("VERIFIED", fontSize = 8.sp, color = Color.White) }
                     }
-                    if (product.verificationStatus == VerificationStatus.VERIFIED) {
+                    if (product.agentInspected) {
                         Badge(containerColor = Color(0xFF9C27B0)) { Text("AGENT INSPECTED", fontSize = 8.sp, color = Color.White) }
                     }
                 }
@@ -694,7 +747,7 @@ fun ProductCard(product: ProductItem, isSwapHub: Boolean, activeGroupDeals: List
                             Column {
                                 Text("KES ${product.groupPrice}", style = MaterialTheme.typography.titleSmall, color = Color(0xFF4CAF50), fontWeight = FontWeight.Bold)
                                 if (deal != null) {
-                                    val progress = deal.currentJoined.toFloat() / deal.minRequired.toFloat()
+                                            val progress = if (deal.minRequired > 0) deal.currentJoined.toFloat() / deal.minRequired.toFloat() else 0f
                                     val remaining = (deal.minRequired - deal.currentJoined).coerceAtLeast(0)
                                     
                                     LinearProgressIndicator(
@@ -740,11 +793,22 @@ fun ProductCard(product: ProductItem, isSwapHub: Boolean, activeGroupDeals: List
 fun ProductDetailDialog(product: ProductItem, isSwapHub: Boolean, cartViewModel: CartViewModel?, discoveryViewModel: DiscoveryViewModel, activeGroupDeals: List<GroupDeal>, onDismiss: () -> Unit) {
     val context = LocalContext.current
     val currentUserId = FirebaseAuth.getInstance().currentUser?.uid
+    var sellerPhone by remember(product.vendorId) { mutableStateOf("") }
+    var sellerName by remember(product.vendorId) { mutableStateOf("") }
     val reviews by discoveryViewModel.reviews.collectAsState()
     val productReviews = reviews[product.id] ?: emptyList()
 
     LaunchedEffect(product.id) {
         discoveryViewModel.fetchReviews(product.id)
+    }
+    LaunchedEffect(product.vendorId) {
+        if (product.vendorId.isNotBlank()) {
+            FirebaseFirestore.getInstance().collection("users").document(product.vendorId).get()
+                .addOnSuccessListener {
+                    sellerPhone = it.getString("contact") ?: it.getString("phone") ?: ""
+                    sellerName = it.getString("name") ?: ""
+                }
+        }
     }
 
     Dialog(
@@ -789,7 +853,8 @@ fun ProductDetailDialog(product: ProductItem, isSwapHub: Boolean, cartViewModel:
                     Column(modifier = Modifier.padding(16.dp)) {
                         FlowRow(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (product.promoLabel.isNotEmpty()) Badge(containerColor = MaterialTheme.colorScheme.tertiary) { Text(product.promoLabel.uppercase()) }
-                            if (product.isNew) Badge(containerColor = Color(0xFFFF9800)) { Text("NEW") }
+                            if (product.condition.isNotBlank()) Badge(containerColor = if (product.condition.equals("New", true)) Color(0xFFFF9800) else MaterialTheme.colorScheme.tertiary) { Text(product.condition.uppercase()) }
+                            if (product.adStatus == AdStatus.ACTIVE && product.adLevel != AdLevel.FREE && (product.adExpiresAt == null || product.adExpiresAt.toDate().time > System.currentTimeMillis())) Badge(containerColor = Color(0xFFFFC107)) { Text("PROMOTED", color = Color.Black) }
                             if (product.verificationStatus == VerificationStatus.VERIFIED) Badge(containerColor = Color(0xFF2196F3)) { Text("VERIFIED BY CBC HUB") }
                             if (product.agentInspected) Badge(containerColor = Color(0xFF9C27B0)) { Text("AGENT INSPECTED") }
                         }
@@ -823,6 +888,8 @@ fun ProductDetailDialog(product: ProductItem, isSwapHub: Boolean, cartViewModel:
                             InfoRow(Icons.Default.PriceCheck, "Estimated Value", "KES ${product.price}")
                             InfoRow(Icons.Default.SwapHoriz, "Swap Preference", product.swapPreference)
                         } else {
+                            InfoRow(Icons.Default.Store, "Seller", sellerName.ifBlank { "Marketplace seller" })
+                            if (product.condition.isNotBlank()) InfoRow(Icons.Default.Inventory2, "Condition", product.condition)
                             val priceText = when(product.listingType) {
                                 ListingType.RETAIL -> "Retail Price: KES ${product.price}"
                                 ListingType.GROUP_DEAL -> "Group Price: KES ${product.groupPrice}"
@@ -898,12 +965,24 @@ fun ProductDetailDialog(product: ProductItem, isSwapHub: Boolean, cartViewModel:
                     color = MaterialTheme.colorScheme.surface
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
+                        if (!isSwapHub && sellerPhone.isNotBlank()) {
+                            OutlinedButton(
+                                onClick = { context.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${sellerPhone.trim()}"))) },
+                                modifier = Modifier.fillMaxWidth().height(48.dp),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Icon(Icons.Default.Call, null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Call seller")
+                            }
+                            Spacer(Modifier.height(8.dp))
+                        }
                         if (product.listingType == ListingType.GROUP_DEAL) {
                             val deal = activeGroupDeals.find { it.productId == product.id }
                             if (deal != null) {
                                 val userHasJoined = deal.buyerDetails.containsKey(currentUserId)
                                 
-                                if (!userHasJoined) {
+                                if (!userHasJoined && deal.status == DealStatus.ACTIVE) {
                                     Button(
                                         onClick = { discoveryViewModel.joinGroupDeal(deal.id) },
                                         modifier = Modifier.fillMaxWidth().height(56.dp).padding(bottom = 8.dp),
@@ -914,7 +993,7 @@ fun ProductDetailDialog(product: ProductItem, isSwapHub: Boolean, cartViewModel:
                                         Spacer(Modifier.width(8.dp))
                                         Text("Join Group Deal")
                                     }
-                                } else {
+                                } else if (userHasJoined) {
                                     Button(
                                         onClick = { 
                                             if (cartViewModel != null) {
@@ -928,6 +1007,10 @@ fun ProductDetailDialog(product: ProductItem, isSwapHub: Boolean, cartViewModel:
                                         Icon(Icons.Default.ShoppingCart, null)
                                         Spacer(Modifier.width(8.dp))
                                         Text("Add to Cart (Group Price)")
+                                    }
+                                } else {
+                                    OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                                        Text("Group target reached · joining closed")
                                     }
                                 }
                             }
@@ -1123,6 +1206,7 @@ fun JobsScreen(
     val isLoading by viewModel.isLoading.collectAsState()
     val searchQuery by viewModel.searchQuery.collectAsState()
     val locationQuery by viewModel.locationQuery.collectAsState()
+    val savedJobIds by viewModel.savedJobIds.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
     val currentUser = FirebaseAuth.getInstance().currentUser
     var showPostDialog by remember { mutableStateOf(false) }
@@ -1131,6 +1215,9 @@ fun JobsScreen(
     var showBoostDialog by remember { mutableStateOf<JobPost?>(null) }
     var applyingToJob by remember { mutableStateOf<JobPost?>(null) }
     var viewingApplicationsFor by remember { mutableStateOf<JobPost?>(null) }
+    var employmentFilter by remember { mutableStateOf("ALL") }
+    var workplaceFilter by remember { mutableStateOf("ALL") }
+    var showSavedOnly by remember { mutableStateOf(false) }
     val applications by viewModel.applications.collectAsState()
     
     val snackbarHostState = remember { SnackbarHostState() }
@@ -1174,6 +1261,18 @@ fun JobsScreen(
                         leadingIcon = { Icon(Icons.Default.LocationOn, null) },
                         singleLine = true
                     )
+                    Spacer(Modifier.height(8.dp))
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(selected = showSavedOnly, onClick = { showSavedOnly = !showSavedOnly }, label = { Text("Saved jobs") }, leadingIcon = { Icon(Icons.Default.Bookmark, null, Modifier.size(16.dp)) })
+                        listOf("ALL", "FULL_TIME", "PART_TIME", "CONTRACT", "INTERNSHIP").forEach { type ->
+                            FilterChip(selected = employmentFilter == type, onClick = { employmentFilter = type }, label = { Text(if (type == "ALL") "Any type" else type.replace("_", " ").lowercase().replaceFirstChar { it.uppercase() }) })
+                        }
+                    }
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf("ALL", "ON_SITE", "HYBRID", "REMOTE").forEach { mode ->
+                            FilterChip(selected = workplaceFilter == mode, onClick = { workplaceFilter = mode }, label = { Text(if (mode == "ALL") "Any workplace" else mode.replace("_", " ").lowercase().replaceFirstChar { it.uppercase() }) })
+                        }
+                    }
                 }
             }
         },
@@ -1196,14 +1295,19 @@ fun JobsScreen(
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                if (jobs.isEmpty()) {
+                val visibleJobs = jobs.filter { job ->
+                    (!showSavedOnly || savedJobIds.contains(job.id)) &&
+                        (employmentFilter == "ALL" || job.employmentType == employmentFilter) &&
+                        (workplaceFilter == "ALL" || job.workplaceType == workplaceFilter)
+                }
+                if (visibleJobs.isEmpty()) {
                     item {
                         Box(modifier = Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) {
-                            Text("No jobs posted yet", color = Color.Gray)
+                            Text(if (showSavedOnly) "No saved jobs match these filters." else "No jobs match these filters.", color = Color.Gray)
                         }
                     }
                 }
-                items(jobs) { job ->
+                items(visibleJobs, key = { it.id }) { job ->
                     JobCard(
                         job = job, 
                         isOwner = job.posterId == currentUser?.uid,
@@ -1212,7 +1316,9 @@ fun JobsScreen(
                         onVerify = { showPayDialog = job },
                         onBoost = { showBoostDialog = job },
                         onApply = { applyingToJob = job },
-                        onViewApplications = { viewingApplicationsFor = job; viewModel.loadApplications(job.id) }
+                        onViewApplications = { viewingApplicationsFor = job; viewModel.loadApplications(job.id) },
+                        isSaved = savedJobIds.contains(job.id),
+                        onSave = { viewModel.toggleSavedJob(job) }
                     )
                 }
             }
@@ -1226,11 +1332,11 @@ fun JobsScreen(
                 showPostDialog = false
                 editingJob = null
             },
-            onConfirm = { title, company, location, desc, salary, reqs, phone, web, deadline, logoUrl ->
+            onConfirm = { title, company, location, desc, salary, reqs, phone, web, deadline, logoUrl, employmentType, workplaceType, experienceLevel, applicationUrl ->
                 if (editingJob == null) {
-                    viewModel.postJob(title, company, location, desc, salary, reqs, phone, web, deadline, logoUrl)
+                    viewModel.postJob(title, company, location, desc, salary, reqs, phone, web, deadline, logoUrl, employmentType, workplaceType, experienceLevel, applicationUrl)
                 } else {
-                    viewModel.updateJob(editingJob!!.id, title, company, location, desc, salary, reqs, phone, web, deadline, logoUrl)
+                    viewModel.updateJob(editingJob!!.id, title, company, location, desc, salary, reqs, phone, web, deadline, logoUrl, employmentType, workplaceType, experienceLevel, applicationUrl)
                 }
                 showPostDialog = false
                 editingJob = null
@@ -1327,7 +1433,7 @@ fun BoostOptionCard(title: String, desc: String, price: String, onClick: () -> U
 }
 
 @Composable
-fun JobCard(job: JobPost, isOwner: Boolean, onEdit: () -> Unit, onDelete: () -> Unit, onVerify: () -> Unit, onBoost: () -> Unit, onApply: () -> Unit, onViewApplications: () -> Unit) {
+fun JobCard(job: JobPost, isOwner: Boolean, onEdit: () -> Unit, onDelete: () -> Unit, onVerify: () -> Unit, onBoost: () -> Unit, onApply: () -> Unit, onViewApplications: () -> Unit, isSaved: Boolean, onSave: () -> Unit) {
     val borderColor = when(job.boostLevel) {
         BoostLevel.TOP_PRIORITY -> Color(0xFFFFB300)
         BoostLevel.FEATURED -> MaterialTheme.colorScheme.primary
@@ -1356,7 +1462,7 @@ fun JobCard(job: JobPost, isOwner: Boolean, onEdit: () -> Unit, onDelete: () -> 
                 }
                 Column(modifier = Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(job.title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                        Text(job.title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         if (job.isVerified) {
                             Icon(Icons.Default.Verified, "Verified", tint = Color(0xFF2196F3), modifier = Modifier.size(18.dp).padding(start = 4.dp))
                         }
@@ -1375,6 +1481,17 @@ fun JobCard(job: JobPost, isOwner: Boolean, onEdit: () -> Unit, onDelete: () -> 
                 if (job.deadline.isNotEmpty()) {
                     Spacer(modifier = Modifier.width(16.dp))
                     Text("Until: ${job.deadline}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+            }
+            Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf(
+                    job.employmentType.replace("_", " ").lowercase().replaceFirstChar { it.uppercase() },
+                    job.workplaceType.replace("_", " ").lowercase().replaceFirstChar { it.uppercase() },
+                    job.experienceLevel.replace("_", " ").lowercase().replaceFirstChar { it.uppercase() }
+                ).forEach { tag ->
+                    Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(16.dp)) {
+                        Text(tag, modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp), style = MaterialTheme.typography.labelSmall)
+                    }
                 }
             }
             
@@ -1401,8 +1518,11 @@ fun JobCard(job: JobPost, isOwner: Boolean, onEdit: () -> Unit, onDelete: () -> 
                             Icon(Icons.Default.Delete, contentDescription = "Delete Job", tint = Color.Red, modifier = Modifier.size(20.dp))
                         }
                     } else {
+                        IconButton(onClick = onSave) {
+                            Icon(if (isSaved) Icons.Default.Bookmark else Icons.Default.BookmarkBorder, contentDescription = if (isSaved) "Unsave job" else "Save job", tint = MaterialTheme.colorScheme.primary)
+                        }
                         Button(onClick = onApply, shape = RoundedCornerShape(8.dp)) {
-                            Text("Apply Now")
+                            Text(if (job.applicationUrl.isNotBlank()) "Apply" else "Apply now")
                         }
                     }
                 }
@@ -1414,6 +1534,7 @@ fun JobCard(job: JobPost, isOwner: Boolean, onEdit: () -> Unit, onDelete: () -> 
 @Composable
 private fun JobApplicationDialog(job: JobPost, onDismiss: () -> Unit, onSubmit: (String) -> Unit) {
     var message by remember { mutableStateOf("") }
+    val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Apply to ${job.company}") },
@@ -1421,6 +1542,10 @@ private fun JobApplicationDialog(job: JobPost, onDismiss: () -> Unit, onSubmit: 
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Your name and email from your account will be shared with the employer.", style = MaterialTheme.typography.bodySmall)
                 OutlinedTextField(message, { message = it }, label = { Text("Short introduction (optional)") }, minLines = 3)
+                if (job.applicationUrl.isNotBlank()) TextButton(onClick = {
+                    val url = if (job.applicationUrl.startsWith("http://") || job.applicationUrl.startsWith("https://")) job.applicationUrl else "https://${job.applicationUrl}"
+                    uriHandler.openUri(url)
+                }) { Text("Open employer application site") }
             }
         },
         confirmButton = { Button(onClick = { onSubmit(message.trim()) }) { Text("Send application") } },
@@ -1432,7 +1557,7 @@ private fun JobApplicationDialog(job: JobPost, onDismiss: () -> Unit, onSubmit: 
 fun JobFormDialog(
     job: JobPost? = null,
     onDismiss: () -> Unit,
-    onConfirm: (String, String, String, String, String, String, String, String, String, String) -> Unit
+    onConfirm: (String, String, String, String, String, String, String, String, String, String, String, String, String, String) -> Unit
 ) {
     var title by remember { mutableStateOf(job?.title ?: "") }
     var company by remember { mutableStateOf(job?.company ?: "") }
@@ -1444,6 +1569,10 @@ fun JobFormDialog(
     var web by remember { mutableStateOf(job?.website ?: "") }
     var deadline by remember { mutableStateOf(job?.deadline ?: "") }
     var logoUrl by remember { mutableStateOf(job?.imageUrl ?: "") }
+    var employmentType by remember { mutableStateOf(job?.employmentType ?: "FULL_TIME") }
+    var workplaceType by remember { mutableStateOf(job?.workplaceType ?: "ON_SITE") }
+    var experienceLevel by remember { mutableStateOf(job?.experienceLevel ?: "MID_LEVEL") }
+    var applicationUrl by remember { mutableStateOf(job?.applicationUrl ?: "") }
     
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         logoUrl = uri.toString()
@@ -1465,17 +1594,36 @@ fun JobFormDialog(
                 OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("Job Title") }, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = company, onValueChange = { company = it }, label = { Text("Company/School Name") }, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = location, onValueChange = { location = it }, label = { Text("Location") }, modifier = Modifier.fillMaxWidth())
+                Text("Employment type", style = MaterialTheme.typography.labelMedium)
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("FULL_TIME", "PART_TIME", "CONTRACT", "INTERNSHIP", "TEMPORARY").forEach { value ->
+                        FilterChip(selected = employmentType == value, onClick = { employmentType = value }, label = { Text(value.replace("_", " ").lowercase().replaceFirstChar { it.uppercase() }) })
+                    }
+                }
+                Text("Workplace", style = MaterialTheme.typography.labelMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("ON_SITE", "HYBRID", "REMOTE").forEach { value ->
+                        FilterChip(selected = workplaceType == value, onClick = { workplaceType = value }, label = { Text(value.replace("_", " ").lowercase().replaceFirstChar { it.uppercase() }) })
+                    }
+                }
+                Text("Experience level", style = MaterialTheme.typography.labelMedium)
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("ENTRY_LEVEL", "MID_LEVEL", "SENIOR", "MANAGER").forEach { value ->
+                        FilterChip(selected = experienceLevel == value, onClick = { experienceLevel = value }, label = { Text(value.replace("_", " ").lowercase().replaceFirstChar { it.uppercase() }) })
+                    }
+                }
                 OutlinedTextField(value = salary, onValueChange = { salary = it }, label = { Text("Salary Range") }, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = deadline, onValueChange = { deadline = it }, label = { Text("Deadline") }, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = phone, onValueChange = { phone = it }, label = { Text("Contact Phone") }, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = web, onValueChange = { web = it }, label = { Text("Website Link") }, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = applicationUrl, onValueChange = { applicationUrl = it }, label = { Text("Application link (optional)") }, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = reqs, onValueChange = { reqs = it }, label = { Text("Requirements") }, modifier = Modifier.fillMaxWidth(), minLines = 2)
                 OutlinedTextField(value = desc, onValueChange = { desc = it }, label = { Text("Job Description") }, modifier = Modifier.fillMaxWidth(), minLines = 3)
             }
         },
         confirmButton = {
             Button(onClick = {
-                onConfirm(title, company, location, desc, salary, reqs, phone, web, deadline, logoUrl)
+                onConfirm(title, company, location, desc, salary, reqs, phone, web, deadline, logoUrl, employmentType, workplaceType, experienceLevel, applicationUrl)
             }, enabled = title.isNotBlank() && company.isNotBlank()) {
                 Text(if (job == null) "Post" else "Update")
             }
@@ -1868,13 +2016,13 @@ fun ProductDetailCard(
                     val deal = activeGroupDeals.find { it.productId == product.id }
                     if (deal != null) {
                         val userHasJoined = deal.buyerDetails.containsKey(currentUserId)
-                        if (!userHasJoined) {
+                        if (!userHasJoined && deal.status == DealStatus.ACTIVE) {
                             Button(onClick = { discoveryViewModel.joinGroupDeal(deal.id) }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))) {
                                 Icon(Icons.Default.GroupAdd, null)
                                 Spacer(Modifier.width(8.dp))
                                 Text("Join Group Deal")
                             }
-                        } else {
+                        } else if (userHasJoined) {
                             Button(onClick = { 
                                 cartViewModel.addToCart(product, PurchaseType.GROUP, dealId = deal.id)
                                 Toast.makeText(context, "Added to cart with discount!", Toast.LENGTH_SHORT).show()
@@ -1882,6 +2030,10 @@ fun ProductDetailCard(
                                 Icon(Icons.Default.ShoppingCart, null)
                                 Spacer(Modifier.width(8.dp))
                                 Text("Add to Cart (Group Price)")
+                            }
+                        } else {
+                            OutlinedButton(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth()) {
+                                Text("Group target reached · joining closed")
                             }
                         }
                     }

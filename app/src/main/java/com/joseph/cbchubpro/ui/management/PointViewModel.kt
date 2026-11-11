@@ -7,6 +7,7 @@ import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 
 import com.google.firebase.firestore.SetOptions
+import com.google.firebase.functions.FirebaseFunctions
 import com.joseph.cbchubpro.network.PesapalAuthRequest
 import com.joseph.cbchubpro.network.PesapalService
 import com.joseph.cbchubpro.network.PesapalIpnRequest
@@ -29,6 +30,7 @@ import java.util.concurrent.TimeUnit
 class PointViewModel : ViewModel() {
     private val auth = FirebaseAuth.getInstance()
     private val firestore = FirebaseFirestore.getInstance()
+    private val functions = FirebaseFunctions.getInstance("us-central1")
 
     private val _pointBalance = MutableStateFlow<PointBalance?>(null)
     val pointBalance: StateFlow<PointBalance?> = _pointBalance.asStateFlow()
@@ -96,104 +98,23 @@ class PointViewModel : ViewModel() {
     }
 
     fun buyPoints(amount: Double, email: String, phoneNumber: String, firstName: String, lastName: String) {
-        val userId = auth.currentUser?.uid ?: return
-        val settings = _platformSettings.value ?: PlatformSettings()
-        
-        // Use the credentials you provided as defaults
-        val consumerKey = settings.pesapalConsumerKey.trim().ifEmpty { "VdiTLwH6c9jD8vVZqlvVoS29QfPv/saf" }
-        val consumerSecret = settings.pesapalConsumerSecret.trim().ifEmpty { "MCy2o8/hKrV7UfPSnpdYAXUFxSg=" }
-        var ipnId = settings.pesapalIpnId.trim()
-        val ipnUrl = "https://pesapalipn-vs7fnli2hq-uc.a.run.app"
-
+        if (auth.currentUser == null) return
         _transactionStatus.value = ActionResultState.Loading
-
         viewModelScope.launch {
             try {
-                val service = getPesapalService()
-                
-                // 1. Authenticate
-                Log.d("PesaPal", "Step 1: Authenticating with Production URL...")
-                val authResponse = try {
-                    service.getAuthToken(PesapalAuthRequest(consumerKey, consumerSecret))
-                } catch (e: HttpException) {
-                    val errorBody = e.response()?.errorBody()?.string() ?: ""
-                    Log.e("PesaPal", "Auth Error: $errorBody")
-                    _transactionStatus.value = ActionResultState.Error("Auth Failed: Check PesaPal Credentials.")
-                    return@launch
-                }
-
-                if (authResponse.token.isEmpty()) {
-                    _transactionStatus.value = ActionResultState.Error("Auth Failed: No token returned.")
-                    return@launch
-                }
-                val token = "Bearer ${authResponse.token}"
-
-                // 2. Resolve IPN ID
-                if (ipnId.isEmpty()) {
-                    Log.d("PesaPal", "Step 2: Resolving IPN ID...")
-                    try {
-                        val ipnResponse = service.registerIPN(token, PesapalIpnRequest(url = ipnUrl))
-                        ipnId = ipnResponse.ipnId ?: ipnResponse.ipnIdGuid ?: ""
-                    } catch (e: HttpException) {
-                        val errorBody = e.response()?.errorBody()?.string() ?: ""
-                        if (e.code() == 400 || errorBody.contains("exists", true)) {
-                             val registeredIPNs = service.getRegisteredIPNs(token)
-                             val matchingIpn = registeredIPNs.find { it.url?.contains("vs7fnli2hq") == true } 
-                                              ?: registeredIPNs.firstOrNull()
-                             ipnId = matchingIpn?.ipnId ?: matchingIpn?.ipnIdGuid ?: ""
-                        }
-                    }
-                }
-
-                if (ipnId.isEmpty()) {
-                    _transactionStatus.value = ActionResultState.Error("Could not resolve IPN ID.")
-                    return@launch
-                }
-                
-                // Update Firestore with the found IPN ID
-                if (settings.pesapalIpnId != ipnId) {
-                    firestore.collection("settings").document("pesapal").update("pesapalIpnId", ipnId)
-                }
-
-                // 3. Submit Order
-                Log.d("PesaPal", "Step 3: Submitting Order...")
-                val orderId = firestore.collection("point_transactions").document().id
-                val orderRequest = PesapalOrderRequest(
-                    id = orderId,
-                    amount = amount,
-                    description = "Purchase of gift points",
-                    callback_url = ipnUrl, 
-                    notification_id = ipnId,
-                    billing_address = PesapalBillingAddress(
-                        email_address = email,
-                        phone_number = phoneNumber,
-                        first_name = firstName,
-                        last_name = lastName
-                    )
-                )
-
-                val orderResponse = service.submitOrder(token, orderRequest)
-                if (orderResponse.redirect_url.isNullOrEmpty()) {
-                    _transactionStatus.value = ActionResultState.Error("Order Failed: ${orderResponse.message}")
-                    return@launch
-                }
-
-                // 4. Record Transaction
-                val transaction = PointTransaction(
-                    id = orderId,
-                    userId = userId,
-                    amountPaid = amount,
-                    pointsAllocated = amount * 0.85,
-                    pesapalOrderTrackingId = orderResponse.order_tracking_id ?: "",
-                    status = "PENDING",
-                    type = PointTransactionType.PURCHASE
-                )
-                firestore.collection("point_transactions").document(orderId).set(transaction).await()
-
-                _transactionStatus.value = ActionResultState.Success(orderResponse.redirect_url)
+                if (!amount.isFinite() || amount < 10.0) throw IllegalArgumentException("Buy at least KES 10 of points.")
+                val result = functions.getHttpsCallable("createPointsCheckout").call(mapOf(
+                    "amount" to amount,
+                    "email" to email,
+                    "phone" to phoneNumber,
+                    "firstName" to firstName,
+                    "lastName" to lastName
+                )).await()
+                val payload = result.data as? Map<*, *> ?: throw IllegalStateException("Payment service returned an invalid response.")
+                val redirectUrl = payload["redirectUrl"] as? String ?: throw IllegalStateException("No PesaPal checkout URL was returned.")
+                _transactionStatus.value = ActionResultState.Success(redirectUrl)
             } catch (e: Exception) {
-                Log.e("PesaPal", "Critical Error", e)
-                _transactionStatus.value = ActionResultState.Error("An error occurred: ${e.message}")
+                _transactionStatus.value = ActionResultState.Error(e.message ?: "Could not start point checkout.")
             }
         }
     }
@@ -282,6 +203,12 @@ class PointViewModel : ViewModel() {
                     transaction.set(receiverRef, mapOf("userId" to receiverId, "totalPoints" to FieldValue.increment(points)), SetOptions.merge())
                     val giftRef = firestore.collection("point_gifts").document()
                     transaction.set(giftRef, PointGift(giftRef.id, senderId, senderName, receiverId, receiverName, contentId, points))
+                    val sentRef = firestore.collection("point_transactions").document()
+                    val receivedRef = firestore.collection("point_transactions").document()
+                    transaction.set(sentRef, PointTransaction(id = sentRef.id, userId = senderId, pointsAllocated = points,
+                        status = "COMPLETED", type = PointTransactionType.GIFT_SENT))
+                    transaction.set(receivedRef, PointTransaction(id = receivedRef.id, userId = receiverId, pointsAllocated = points,
+                        status = "COMPLETED", type = PointTransactionType.GIFT_RECEIVED))
                 }.await()
                 _transactionStatus.value = ActionResultState.Success("Gifted successfully")
             } catch (e: Exception) {
@@ -293,6 +220,10 @@ class PointViewModel : ViewModel() {
     fun requestRedemption(points: Double, paymentDetails: String) {
         val userId = auth.currentUser?.uid ?: return
         val userName = auth.currentUser?.displayName ?: "Teacher"
+        if (!points.isFinite() || points <= 0.0 || paymentDetails.isBlank()) {
+            _transactionStatus.value = ActionResultState.Error("Enter a valid points amount and M-Pesa number.")
+            return
+        }
         _transactionStatus.value = ActionResultState.Loading
 
         viewModelScope.launch {

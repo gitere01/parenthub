@@ -93,6 +93,9 @@ fun DashboardRoleRouter(
                             TeacherManagementScreen(onLogoutClicked = onLogoutClicked)
                         }
                     }
+                    "student", "child" -> {
+                        ChildLearningScreen(onLogoutClicked = onLogoutClicked)
+                    }
                     "school", "security guard", "receptionist", "principal", "deputy principal", "secretary", "admin assistant", "driver", "cleaner" -> {
                         SchoolManagementScreen(onLogoutClicked = onLogoutClicked)
                     }

@@ -55,7 +55,8 @@ data class ProductItem(
     val phoneVerified: Boolean = false,
     val isGroupDeal: Boolean = false,
     val adLevel: AdLevel = AdLevel.FREE,
-    val adStatus: AdStatus = AdStatus.INACTIVE
+    val adStatus: AdStatus = AdStatus.INACTIVE,
+    val adExpiresAt: Timestamp? = null
 )
 
 @IgnoreExtraProperties
@@ -122,6 +123,16 @@ data class Order(
     val disputeReason: String = "",
     val dealId: String? = null,
     val isReviewed: Boolean = false
+)
+
+data class VendorPayoutRequest(
+    @Exclude val id: String = "",
+    val vendorId: String = "",
+    val vendorName: String = "",
+    val amount: Double = 0.0,
+    val phone: String = "",
+    val status: String = "PENDING",
+    val createdAt: Timestamp = Timestamp.now()
 )
 
 enum class DeliveryMethod {

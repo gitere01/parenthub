@@ -33,6 +33,10 @@ data class JobPost(
     val website: String = "",
     val phoneNumber: String = "",
     val deadline: String = "",
+    val employmentType: String = "FULL_TIME",
+    val workplaceType: String = "ON_SITE",
+    val experienceLevel: String = "MID_LEVEL",
+    val applicationUrl: String = "",
     val imageUrl: String = "",
     val posterId: String = "",
     val posterName: String = "",
@@ -88,9 +92,36 @@ class JobViewModel : ViewModel() {
 
     private val _applications = MutableStateFlow<List<JobApplication>>(emptyList())
     val applications = _applications.asStateFlow()
+    private val _savedJobIds = MutableStateFlow<Set<String>>(emptySet())
+    val savedJobIds = _savedJobIds.asStateFlow()
 
     init {
         fetchJobs()
+        fetchSavedJobs()
+    }
+
+    private fun fetchSavedJobs() {
+        val uid = auth.currentUser?.uid ?: return
+        db.collection("users").document(uid).collection("saved_jobs").addSnapshotListener { snapshot, _ ->
+            _savedJobIds.value = snapshot?.documents?.map { it.id }?.toSet().orEmpty()
+        }
+    }
+
+    fun toggleSavedJob(job: JobPost) {
+        val uid = auth.currentUser?.uid
+        if (uid == null) { _statusMessage.value = "Sign in to save jobs."; return }
+        viewModelScope.launch {
+            try {
+                val ref = db.collection("users").document(uid).collection("saved_jobs").document(job.id)
+                if (_savedJobIds.value.contains(job.id)) {
+                    ref.delete().await()
+                    _statusMessage.value = "Removed from saved jobs."
+                } else {
+                    ref.set(mapOf("jobId" to job.id, "title" to job.title, "company" to job.company, "savedAt" to com.google.firebase.Timestamp.now())).await()
+                    _statusMessage.value = "Job saved."
+                }
+            } catch (e: Exception) { _statusMessage.value = "Could not save job: ${e.message ?: "Please try again."}" }
+        }
     }
 
     private fun fetchJobs() {
@@ -101,7 +132,7 @@ class JobViewModel : ViewModel() {
             }
     }
 
-    fun postJob(title: String, company: String, location: String, desc: String, salary: String, reqs: String, phone: String, web: String, deadline: String, logoUrl: String) {
+    fun postJob(title: String, company: String, location: String, desc: String, salary: String, reqs: String, phone: String, web: String, deadline: String, logoUrl: String, employmentType: String, workplaceType: String, experienceLevel: String, applicationUrl: String) {
         val uid = auth.currentUser?.uid ?: return
         val name = auth.currentUser?.displayName ?: "User"
         viewModelScope.launch {
@@ -116,6 +147,10 @@ class JobViewModel : ViewModel() {
                     phoneNumber = phone,
                     website = web,
                     deadline = deadline,
+                    employmentType = employmentType,
+                    workplaceType = workplaceType,
+                    experienceLevel = experienceLevel,
+                    applicationUrl = applicationUrl,
                     imageUrl = logoUrl,
                     posterId = uid,
                     posterName = name,
@@ -129,7 +164,7 @@ class JobViewModel : ViewModel() {
         }
     }
 
-    fun updateJob(jobId: String, title: String, company: String, location: String, desc: String, salary: String, reqs: String, phone: String, web: String, deadline: String, logoUrl: String) {
+    fun updateJob(jobId: String, title: String, company: String, location: String, desc: String, salary: String, reqs: String, phone: String, web: String, deadline: String, logoUrl: String, employmentType: String, workplaceType: String, experienceLevel: String, applicationUrl: String) {
         viewModelScope.launch {
             try {
                 val updates = mapOf(
@@ -142,7 +177,11 @@ class JobViewModel : ViewModel() {
                     "phoneNumber" to phone,
                     "website" to web,
                     "deadline" to deadline,
-                    "imageUrl" to logoUrl
+                    "imageUrl" to logoUrl,
+                    "employmentType" to employmentType,
+                    "workplaceType" to workplaceType,
+                    "experienceLevel" to experienceLevel,
+                    "applicationUrl" to applicationUrl
                 )
                 db.collection("jobs").document(jobId).update(updates).await()
                 _statusMessage.value = "Job updated!"
